@@ -7,7 +7,7 @@ use futures::task::{Context, Poll};
 use super::stack_impl::NetStackImpl;
 use super::tcp_listener::TcpListener;
 use super::udp::UdpSocket;
-use crate::Error;
+use crate::{Error, IpPacket};
 
 pub struct NetStack(Box<NetStackImpl>);
 
@@ -33,7 +33,7 @@ impl NetStack {
 }
 
 impl Stream for NetStack {
-    type Item = io::Result<Vec<u8>>;
+    type Item = io::Result<IpPacket>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.0).poll_next(cx)

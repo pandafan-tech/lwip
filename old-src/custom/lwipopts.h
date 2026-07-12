@@ -98,8 +98,20 @@
 #define LWIP_CHKSUM_ALGORITHM 3
 
 #define TCP_MSS 1460
+#if defined __APPLE__ && TARGET_OS_IPHONE
+// Network Extension has a tight process-memory ceiling. Keep the mobile
+// receive/send budget conservative; the device-side TUN RTT is tiny.
 #define TCP_WND (32 * TCP_MSS)
 #define TCP_SND_BUF (16 * TCP_MSS)
+#else
+// Desktop and Android have a larger packet-stack memory budget. Advertise the
+// same 46,720-byte unscaled window with a x4 scale factor, allowing the receive
+// side to grow to 186,880 bytes when the relay keeps up.
+#define LWIP_WND_SCALE 1
+#define TCP_RCV_SCALE 2
+#define TCP_WND (128 * TCP_MSS)
+#define TCP_SND_BUF (64 * TCP_MSS)
+#endif
 
 #if defined __APPLE__
 #include <TargetConditionals.h>

@@ -73,6 +73,7 @@ fn compile_lwip() {
         // .file("old-src/core/ipv6/mld6.c")
         .file("old-src/core/ipv6/nd6.c")
         .file("old-src/custom/sys_arch.c")
+        .file("old-src/custom/rust_accessors.c")
         .file("src/api/err.c")
         .include("old-src/custom")
         .include("old-src/include")

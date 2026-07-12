@@ -4,3 +4,4 @@
 #include "../include/lwip/tcp.h"
 #include "../include/lwip/udp.h"
 #include "../include/lwip/ip_addr.h"
+#include "rust_accessors.h"

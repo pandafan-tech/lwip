@@ -7,6 +7,7 @@ use log::{error, warn};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::lwip::*;
+use super::packet::{IpPacket, PacketPool};
 use super::util;
 use crate::Error;
 
@@ -27,11 +28,18 @@ pub unsafe extern "C" fn udp_recv_cb(
     let src_addr = util::to_socket_addr(&*addr, port);
     let dst_addr = util::to_socket_addr(&*dst_addr, dst_port);
     let tot_len = std::ptr::read_unaligned(p).tot_len;
-    let mut buf = Vec::with_capacity(tot_len as usize);
-    pbuf_copy_partial(p, buf.as_mut_ptr() as *mut _, tot_len, 0);
-    buf.set_len(tot_len as usize);
+    let mut packet = socket.packet_pool.acquire(tot_len as usize);
+    let copied = {
+        let spare = packet.spare_capacity_mut();
+        pbuf_copy_partial(p, spare.as_mut_ptr().cast(), tot_len, 0)
+    };
     pbuf_free(p);
-    if socket.tx.try_send((buf, src_addr, dst_addr)).is_err() {
+    if copied != tot_len {
+        warn!("short lwIP UDP pbuf copy: {copied}/{tot_len}");
+        return;
+    }
+    packet.set_len(tot_len as usize);
+    if socket.tx.try_send((packet, src_addr, dst_addr)).is_err() {
         // log::trace!("try send udp pkt failed (netstack): {}", e);
     }
     if let Some(waker) = socket.waker.as_ref() {
@@ -70,13 +78,14 @@ fn send_udp(
     }
 }
 
-pub type UdpPkt = (Vec<u8>, SocketAddr, SocketAddr);
+pub type UdpPkt = (IpPacket, SocketAddr, SocketAddr);
 
 pub struct UdpSocket {
     pcb: usize,
     waker: Option<Waker>,
     tx: Sender<UdpPkt>,
     rx: Receiver<UdpPkt>,
+    packet_pool: std::sync::Arc<PacketPool>,
 }
 
 impl UdpSocket {
@@ -84,11 +93,13 @@ impl UdpSocket {
         unsafe {
             let pcb = udp_new();
             let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
+            let packet_pool = PacketPool::new(buffer_size.min(256).max(1), 4 * 1024);
             let socket = Box::new(Self {
                 pcb: pcb as usize,
                 waker: None,
                 tx,
                 rx,
+                packet_pool,
             });
             let err = udp_bind(pcb, &ip_addr_any_type, 0);
             if err != err_enum_t_ERR_OK as err_t {
@@ -108,8 +119,9 @@ impl UdpSocket {
     pub fn local_addr(&self) -> SocketAddr {
         unsafe {
             let pcb = self.pcb as *mut udp_pcb;
-            let ip = (*pcb).local_ip;
-            let port = (*pcb).local_port;
+            let mut ip = std::mem::zeroed();
+            let mut port = 0;
+            lwip_rs_udp_local_endpoint(pcb, &mut ip, &mut port);
             util::to_socket_addr(&ip, port)
         }
     }

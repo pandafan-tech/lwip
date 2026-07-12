@@ -1,6 +1,5 @@
-use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin};
+use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin, sync::Arc, sync::OnceLock};
 
-use bytes::BytesMut;
 use futures::task::{Context, Poll};
 use log::*;
 use tokio::{
@@ -9,9 +8,19 @@ use tokio::{
 };
 
 use super::lwip::*;
+use super::packet::{IpPacket, PacketPool};
 use super::tcp_stream_context::TcpStreamContext;
 use super::util;
 use super::LWIP_MUTEX;
+
+const TCP_PACKET_CACHE: usize = 16;
+const TCP_PACKET_MAX_CAPACITY: usize = u16::MAX as usize;
+static TCP_PACKET_POOL: OnceLock<Arc<PacketPool>> = OnceLock::new();
+
+fn tcp_packet_pool() -> &'static Arc<PacketPool> {
+    TCP_PACKET_POOL
+        .get_or_init(|| PacketPool::new(TCP_PACKET_CACHE, TCP_PACKET_MAX_CAPACITY))
+}
 
 #[allow(unused_variables)]
 pub unsafe extern "C" fn tcp_recv_cb(
@@ -32,20 +41,31 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
-        ctx.read_tx.as_ref().map(|tx| tx.send(Vec::new()));
+        ctx.read_tx
+            .as_ref()
+            .map(|tx| tx.send(Vec::new().into()));
         return err_enum_t_ERR_OK as err_t;
     }
 
     let pbuflen = std::ptr::read_unaligned(p).tot_len;
-    let mut buf = Vec::with_capacity(pbuflen as usize);
-    pbuf_copy_partial(p, buf.as_mut_ptr() as _, pbuflen, 0);
-    buf.set_len(pbuflen as usize);
+    let mut packet = tcp_packet_pool().acquire(pbuflen as usize);
+    let copied = pbuf_copy_partial(
+        p,
+        packet.spare_capacity_mut().as_mut_ptr().cast(),
+        pbuflen,
+        0,
+    );
+    pbuf_free(p);
+    if copied != pbuflen {
+        warn!("short lwIP TCP pbuf copy: {copied}/{pbuflen}");
+        return err_enum_t_ERR_OK as err_t;
+    }
+    packet.set_len(pbuflen as usize);
 
-    if !buf.is_empty() {
-        ctx.read_tx.as_ref().map(|tx| tx.send(buf));
+    if !packet.is_empty() {
+        ctx.read_tx.as_ref().map(|tx| tx.send(packet));
     }
 
-    pbuf_free(p);
     err_enum_t_ERR_OK as err_t
 }
 
@@ -90,7 +110,7 @@ pub struct TcpStreamImpl {
     src_addr: SocketAddr,
     dest_addr: SocketAddr,
     pcb: usize,
-    write_buf: BytesMut,
+    read_buf: Option<(IpPacket, usize)>,
     callback_ctx: TcpStreamContext,
 }
 
@@ -105,14 +125,24 @@ impl TcpStreamImpl {
             // Thus our unbounded channel will never be overwhelmed. To achieve this, we must
             // call `tcp_recved` when the data from our internal buffer are consumed.
             let (read_tx, read_rx) = unbounded_channel();
-            let pcb_v = std::ptr::read_unaligned(pcb);
-            let src_addr = util::to_socket_addr(&pcb_v.remote_ip, pcb_v.remote_port);
-            let dest_addr = util::to_socket_addr(&pcb_v.local_ip, pcb_v.local_port);
+            let mut remote_ip = std::mem::zeroed();
+            let mut remote_port = 0;
+            let mut local_ip = std::mem::zeroed();
+            let mut local_port = 0;
+            lwip_rs_tcp_endpoints(
+                pcb,
+                &mut remote_ip,
+                &mut remote_port,
+                &mut local_ip,
+                &mut local_port,
+            );
+            let src_addr = util::to_socket_addr(&remote_ip, remote_port);
+            let dest_addr = util::to_socket_addr(&local_ip, local_port);
             let stream = Box::new(TcpStreamImpl {
                 src_addr,
                 dest_addr,
                 pcb: pcb as usize,
-                write_buf: BytesMut::new(),
+                read_buf: None,
                 callback_ctx: TcpStreamContext::new(src_addr, dest_addr, read_tx, read_rx),
             });
             let arg = &stream.callback_ctx as *const _;
@@ -129,13 +159,7 @@ impl TcpStreamImpl {
 
     fn apply_pcb_opts(&self) {
         unsafe {
-            let mut pcb_v = std::ptr::read_unaligned(self.pcb as *const tcp_pcb);
-            #[cfg(target_os = "ios")]
-            {
-                pcb_v.so_options |= SOF_KEEPALIVE as u8;
-            }
-            pcb_v.flags |= TF_NODELAY as u16;
-            std::ptr::write_unaligned(self.pcb as *mut tcp_pcb, pcb_v);
+            lwip_rs_tcp_apply_options(self.pcb as *mut tcp_pcb, cfg!(target_os = "ios") as i32);
         }
     }
 
@@ -148,7 +172,7 @@ impl TcpStreamImpl {
     }
 
     fn send_buf_size(&self) -> usize {
-        unsafe { std::ptr::read_unaligned(self.pcb as *const tcp_pcb).snd_buf as usize }
+        unsafe { lwip_rs_tcp_send_buffer(self.pcb as *const tcp_pcb) as usize }
     }
 }
 
@@ -168,17 +192,19 @@ impl AsyncRead for TcpStreamImpl {
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
         }
-        if !me.write_buf.is_empty() {
-            let to_read = min(buf.remaining(), me.write_buf.len());
-            let piece = me.write_buf.split_to(to_read);
-            buf.put_slice(&piece[..to_read]);
-            return Poll::Ready(Ok(()));
-        }
         let mut has_read_data = false;
         loop {
+            if let Some((data, offset)) = me.read_buf.as_mut() {
+                let to_read = min(buf.remaining(), data.len() - *offset);
+                buf.put_slice(&data[*offset..*offset + to_read]);
+                *offset += to_read;
+                if *offset == data.len() {
+                    me.read_buf.take();
+                }
+                return Poll::Ready(Ok(()));
+            }
             match Pin::new(&mut ctx.read_rx).poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
-                    // EOF
                     if data.is_empty() {
                         return Poll::Ready(Ok(()));
                     }
@@ -187,7 +213,7 @@ impl AsyncRead for TcpStreamImpl {
                     buf.put_slice(&data[..to_read]);
                     has_read_data = true;
                     if to_read < data.len() {
-                        me.write_buf.extend_from_slice(&data[to_read..]);
+                        me.read_buf = Some((data, to_read));
                         return Poll::Ready(Ok(()));
                     }
                 }

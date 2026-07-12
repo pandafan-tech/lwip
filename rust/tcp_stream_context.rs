@@ -7,13 +7,14 @@ use std::{
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use super::packet::IpPacket;
 use super::LWIPMutexGuard;
 
 pub struct TcpStreamContextInner {
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
-    pub read_tx: Option<UnboundedSender<Vec<u8>>>,
-    pub read_rx: UnboundedReceiver<Vec<u8>>,
+    pub read_tx: Option<UnboundedSender<IpPacket>>,
+    pub read_rx: UnboundedReceiver<IpPacket>,
     pub errored: bool,
     pub closed: bool,
     pub write_waker: Option<Waker>,
@@ -57,8 +58,8 @@ impl TcpStreamContext {
     pub fn new(
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
-        read_tx: UnboundedSender<Vec<u8>>,
-        read_rx: UnboundedReceiver<Vec<u8>>,
+        read_tx: UnboundedSender<IpPacket>,
+        read_rx: UnboundedReceiver<IpPacket>,
     ) -> Self {
         TcpStreamContext {
             inner: UnsafeCell::new(TcpStreamContextInner {

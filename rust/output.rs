@@ -5,15 +5,21 @@ pub static mut OUTPUT_CB_PTR: usize = 0x0;
 
 fn output(_netif: *mut netif, p: *mut pbuf) -> err_t {
     unsafe {
-        let pbuflen = std::ptr::read_unaligned(p).tot_len;
-        let mut buf = Vec::with_capacity(pbuflen as usize);
-        pbuf_copy_partial(p, buf.as_mut_ptr() as *mut _, pbuflen, 0);
-        buf.set_len(pbuflen as usize);
         if OUTPUT_CB_PTR == 0x0 {
             return err_enum_t_ERR_ABRT as err_t;
         }
         let stack = &mut *(OUTPUT_CB_PTR as *mut NetStackImpl);
-        stack.output(buf);
+        let pbuflen = std::ptr::read_unaligned(p).tot_len;
+        let mut packet = stack.acquire_output_packet(pbuflen as usize);
+        let copied = {
+            let spare = packet.spare_capacity_mut();
+            pbuf_copy_partial(p, spare.as_mut_ptr().cast(), pbuflen, 0)
+        };
+        if copied != pbuflen {
+            return err_enum_t_ERR_BUF as err_t;
+        }
+        packet.set_len(pbuflen as usize);
+        stack.output(packet);
         err_enum_t_ERR_OK as err_t
     }
 }

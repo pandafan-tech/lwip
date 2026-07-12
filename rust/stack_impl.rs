@@ -7,14 +7,18 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::lwip::*;
 use super::output::{output_ip4, output_ip6, OUTPUT_CB_PTR};
+use super::packet::{IpPacket, PacketPool, PacketPoolStats};
 use super::LWIP_MUTEX;
 
 static LWIP_INIT: Once = Once::new();
+const OUTPUT_PACKET_CACHE: usize = 256;
+const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
 
 pub struct NetStackImpl {
     waker: Option<Waker>,
-    tx: Sender<Vec<u8>>,
-    rx: Receiver<Vec<u8>>,
+    tx: Sender<IpPacket>,
+    rx: Receiver<IpPacket>,
+    output_pool: std::sync::Arc<PacketPool>,
     sink_buf: Option<Vec<u8>>, // We're flushing per item, no need large buffer.
     // Drives lwIP's sys_check_timeouts; aborted in Drop. Without the abort,
     // every NetStackImpl ever created leaks an immortal 250 ms timer task.
@@ -30,13 +34,13 @@ impl NetStackImpl {
     pub fn new(buffer_size: usize) -> Box<Self> {
         LWIP_INIT.call_once(|| unsafe { lwip_init() });
 
-        unsafe {
-            (*netif_list).output = Some(output_ip4);
-            (*netif_list).output_ip6 = Some(output_ip6);
-            (*netif_list).mtu = 1500;
-        }
+        unsafe { lwip_rs_configure_netif(Some(output_ip4), Some(output_ip6), 1500) };
 
-        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel(buffer_size);
+        let (tx, rx): (Sender<IpPacket>, Receiver<IpPacket>) = channel(buffer_size);
+        let output_pool = PacketPool::new(
+            buffer_size.min(OUTPUT_PACKET_CACHE).max(1),
+            OUTPUT_PACKET_MAX_CAPACITY,
+        );
 
         let timeout_task = tokio::spawn(async move {
             loop {
@@ -55,6 +59,7 @@ impl NetStackImpl {
             waker: None,
             tx,
             rx,
+            output_pool,
             sink_buf: None,
             timeout_task,
         });
@@ -66,7 +71,11 @@ impl NetStackImpl {
         stack
     }
 
-    pub fn output(&mut self, pkt: Vec<u8>) {
+    pub(crate) fn acquire_output_packet(&self, length: usize) -> IpPacket {
+        self.output_pool.acquire(length)
+    }
+
+    pub(crate) fn output(&mut self, pkt: IpPacket) {
         if self.tx.try_send(pkt).is_err() {
             // log::trace!("try send stack output pkt failed: {}", e);
         }
@@ -74,11 +83,24 @@ impl NetStackImpl {
             waker.wake_by_ref();
         }
     }
+
+    pub(crate) fn output_pool_stats(&self) -> PacketPoolStats {
+        self.output_pool.stats()
+    }
 }
 
 impl Drop for NetStackImpl {
     fn drop(&mut self) {
         log::trace!("drop netstack");
+        let stats = self.output_pool_stats();
+        log::debug!(
+            "lwip output pool: allocations={}, reuses={}, returned={}, discarded={}, cached={}",
+            stats.allocations,
+            stats.reuses,
+            stats.returned,
+            stats.discarded,
+            stats.cached
+        );
         self.timeout_task.abort();
         unsafe {
             let _g = LWIP_MUTEX.lock();
@@ -94,7 +116,7 @@ impl Drop for NetStackImpl {
 }
 
 impl Stream for NetStackImpl {
-    type Item = io::Result<Vec<u8>>;
+    type Item = io::Result<IpPacket>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let _g = LWIP_MUTEX.lock();
@@ -144,7 +166,10 @@ impl Sink<Vec<u8>> for NetStackImpl {
                     // driver task that owns both ingress and egress. An IP
                     // device is allowed to drop frames under memory pressure
                     // — the sender retransmits — so drop and report success.
-                    log::warn!("pbuf_alloc failed (heap exhausted), dropping {} byte frame", item.len());
+                    log::warn!(
+                        "pbuf_alloc failed (heap exhausted), dropping {} byte frame",
+                        item.len()
+                    );
                     return Poll::Ready(Ok(()));
                 }
                 pbuf_take(
@@ -153,24 +178,16 @@ impl Sink<Vec<u8>> for NetStackImpl {
                     item.len() as u16_t,
                 );
 
-                if let Some(input_fn) = (*netif_list).input {
-                    let err = input_fn(pbuf, netif_list);
-                    if err != err_enum_t_ERR_OK as err_t {
-                        // A rejected frame is a per-packet event (e.g. ERR_MEM
-                        // mid-burst), not a stack-fatal one. Drop it instead of
-                        // erroring the Sink: callers treat a Sink error as
-                        // fatal and tear down the whole packet path.
-                        pbuf_free(pbuf);
-                        log::warn!("netif input rejected frame: {}", err);
-                    }
-                    Poll::Ready(Ok(()))
-                } else {
+                let err = lwip_rs_netif_input(pbuf);
+                if err != err_enum_t_ERR_OK as err_t {
+                    // A rejected frame is a per-packet event (e.g. ERR_MEM
+                    // mid-burst), not a stack-fatal one. Drop it instead of
+                    // erroring the Sink: callers treat a Sink error as
+                    // fatal and tear down the whole packet path.
                     pbuf_free(pbuf);
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "input fn not set",
-                    )))
+                    log::warn!("netif input rejected frame: {}", err);
                 }
+                Poll::Ready(Ok(()))
             }
         } else {
             Poll::Ready(Ok(()))
