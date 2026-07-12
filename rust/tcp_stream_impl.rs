@@ -18,8 +18,7 @@ const TCP_PACKET_MAX_CAPACITY: usize = u16::MAX as usize;
 static TCP_PACKET_POOL: OnceLock<Arc<PacketPool>> = OnceLock::new();
 
 fn tcp_packet_pool() -> &'static Arc<PacketPool> {
-    TCP_PACKET_POOL
-        .get_or_init(|| PacketPool::new(TCP_PACKET_CACHE, TCP_PACKET_MAX_CAPACITY))
+    TCP_PACKET_POOL.get_or_init(|| PacketPool::new(TCP_PACKET_CACHE, TCP_PACKET_MAX_CAPACITY))
 }
 
 #[allow(unused_variables)]
@@ -41,9 +40,7 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
-        ctx.read_tx
-            .as_ref()
-            .map(|tx| tx.send(Vec::new().into()));
+        ctx.read_tx.as_ref().map(|tx| tx.send(Vec::new().into()));
         return err_enum_t_ERR_OK as err_t;
     }
 

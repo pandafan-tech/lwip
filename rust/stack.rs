@@ -3,6 +3,7 @@ use std::{io, pin::Pin};
 use futures::sink::Sink;
 use futures::stream::Stream;
 use futures::task::{Context, Poll};
+use tokio::sync::mpsc::Receiver;
 
 use super::stack_impl::NetStackImpl;
 use super::tcp_listener::TcpListener;
@@ -29,6 +30,46 @@ impl NetStack {
             TcpListener::new()?,
             UdpSocket::new(udp_buffer_size)?,
         ))
+    }
+
+    /// Split into an ingress half (batch input into lwIP) and an egress half
+    /// (a plain channel of packets leaving lwIP). The two halves can be
+    /// driven from different tasks so TUN read and TUN write directions no
+    /// longer serialize on one driver task.
+    pub fn split(mut self) -> (StackIngress, StackEgress) {
+        let rx = self.0.take_egress();
+        (StackIngress(self.0), StackEgress(rx))
+    }
+}
+
+/// Ingress half: feeds whole read batches into lwIP under one lock hold.
+/// Dropping it tears the stack down (it owns the `NetStackImpl`).
+pub struct StackIngress(Box<NetStackImpl>);
+
+impl StackIngress {
+    /// Push a batch of raw IP packets into lwIP. One `LWIP_MUTEX` acquisition
+    /// covers the whole batch.
+    pub fn input_batch<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.0.input_batch(items);
+    }
+}
+
+/// Egress half: packets leaving lwIP toward the TUN device. Ends (returns
+/// `None`) after the ingress half is dropped.
+pub struct StackEgress(Receiver<IpPacket>);
+
+impl StackEgress {
+    pub async fn recv(&mut self) -> Option<IpPacket> {
+        self.0.recv().await
+    }
+
+    /// Receive up to `limit` packets in one call, awaiting until at least one
+    /// is available. Returns the number received (0 = channel closed).
+    pub async fn recv_many(&mut self, buffer: &mut Vec<IpPacket>, limit: usize) -> usize {
+        self.0.recv_many(buffer, limit).await
     }
 }
 

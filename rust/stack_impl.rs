@@ -2,7 +2,7 @@ use std::{io, os::raw, pin::Pin, sync::Once, time};
 
 use futures::sink::Sink;
 use futures::stream::Stream;
-use futures::task::{Context, Poll, Waker};
+use futures::task::{Context, Poll};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::lwip::*;
@@ -15,9 +15,10 @@ const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
 
 pub struct NetStackImpl {
-    waker: Option<Waker>,
     tx: Sender<IpPacket>,
-    rx: Receiver<IpPacket>,
+    // Taken by `take_egress()` so a consumer can drain egress packets from a
+    // dedicated task while another task feeds ingress through the Sink half.
+    rx: Option<Receiver<IpPacket>>,
     output_pool: std::sync::Arc<PacketPool>,
     sink_buf: Option<Vec<u8>>, // We're flushing per item, no need large buffer.
     // Drives lwIP's sys_check_timeouts; aborted in Drop. Without the abort,
@@ -56,9 +57,8 @@ impl NetStackImpl {
         });
 
         let stack = Box::new(NetStackImpl {
-            waker: None,
             tx,
-            rx,
+            rx: Some(rx),
             output_pool,
             sink_buf: None,
             timeout_task,
@@ -76,11 +76,55 @@ impl NetStackImpl {
     }
 
     pub(crate) fn output(&mut self, pkt: IpPacket) {
+        // tokio's mpsc wakes the receiver on try_send; no manual waker is
+        // needed, so egress consumers never have to touch LWIP_MUTEX.
         if self.tx.try_send(pkt).is_err() {
             // log::trace!("try send stack output pkt failed: {}", e);
         }
-        if let Some(waker) = self.waker.as_ref() {
-            waker.wake_by_ref();
+    }
+
+    /// Take the egress receiver so packets leaving lwIP can be drained from a
+    /// dedicated task, concurrently with ingress. Panics if taken twice.
+    pub(crate) fn take_egress(&mut self) -> Receiver<IpPacket> {
+        self.rx
+            .take()
+            .expect("netstack egress receiver already taken")
+    }
+
+    /// Push a whole batch of ingress IP packets into lwIP under a single
+    /// LWIP_MUTEX acquisition. Per-packet locking dominated the ingress cost
+    /// at high packet rates; a TUN read batch is the natural lock scope.
+    pub(crate) fn input_batch<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let _g = LWIP_MUTEX.lock();
+        for item in items {
+            if item.is_empty() {
+                continue;
+            }
+            unsafe {
+                let pbuf = pbuf_alloc(pbuf_layer_PBUF_RAW, item.len() as u16_t, pbuf_type_PBUF_RAM);
+                if pbuf.is_null() {
+                    // lwIP heap exhaustion: an IP device may drop frames under
+                    // memory pressure — the sender retransmits.
+                    log::warn!(
+                        "pbuf_alloc failed (heap exhausted), dropping {} byte frame",
+                        item.len()
+                    );
+                    continue;
+                }
+                pbuf_take(
+                    pbuf,
+                    item.as_ptr() as *const raw::c_void,
+                    item.len() as u16_t,
+                );
+                let err = lwip_rs_netif_input(pbuf);
+                if err != err_enum_t_ERR_OK as err_t {
+                    pbuf_free(pbuf);
+                    log::warn!("netif input rejected frame: {}", err);
+                }
+            }
         }
     }
 
@@ -119,14 +163,16 @@ impl Stream for NetStackImpl {
     type Item = io::Result<IpPacket>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let _g = LWIP_MUTEX.lock();
-        match self.rx.poll_recv(cx) {
+        // Plain channel read: the sender side (lwIP output callback) already
+        // runs under LWIP_MUTEX, and tokio's mpsc handles waking.
+        let rx = self
+            .rx
+            .as_mut()
+            .expect("netstack egress receiver already taken");
+        match rx.poll_recv(cx) {
             Poll::Ready(Some(pkt)) => Poll::Ready(Some(Ok(pkt))),
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                self.waker.replace(cx.waker().clone());
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
