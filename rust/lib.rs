@@ -17,7 +17,9 @@ mod util;
 pub(crate) static LWIP_MUTEX: mutex::AtomicMutex = mutex::AtomicMutex::new();
 pub(crate) use mutex::AtomicMutexGuard as LWIPMutexGuard;
 
-pub use packet::{trim_packet_pools, IpPacket, PacketPool};
+pub use packet::{
+    packet_pool_runtime_stats, trim_packet_pools, IpPacket, PacketPool, PacketPoolsRuntimeStats,
+};
 pub use stack::{NetStack, StackEgress, StackIngress};
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;

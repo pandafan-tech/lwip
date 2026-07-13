@@ -1,7 +1,7 @@
 use crossbeam_queue::ArrayQueue;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 fn packet_pool_registry() -> &'static Mutex<Vec<Weak<PacketPool>>> {
@@ -25,12 +25,46 @@ pub fn trim_packet_pools() -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketPoolsRuntimeStats {
+    pub live_pools: usize,
+    pub cached_packets: usize,
+    pub cached_bytes: usize,
+    pub allocations: u64,
+    pub reuses: u64,
+    pub returned: u64,
+    pub discarded: u64,
+}
+
+pub fn packet_pool_runtime_stats() -> PacketPoolsRuntimeStats {
+    let mut registry = packet_pool_registry()
+        .lock()
+        .expect("packet pool registry poisoned");
+    let mut runtime = PacketPoolsRuntimeStats::default();
+    registry.retain(|weak| {
+        let Some(pool) = weak.upgrade() else {
+            return false;
+        };
+        let stats = pool.stats();
+        runtime.live_pools += 1;
+        runtime.cached_packets += stats.cached;
+        runtime.cached_bytes += stats.cached_bytes;
+        runtime.allocations += stats.allocations;
+        runtime.reuses += stats.reuses;
+        runtime.returned += stats.returned;
+        runtime.discarded += stats.discarded;
+        true
+    });
+    runtime
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PacketPoolStats {
     pub allocations: u64,
     pub reuses: u64,
     pub returned: u64,
     pub discarded: u64,
     pub cached: usize,
+    pub cached_bytes: usize,
 }
 
 pub struct PacketPool {
@@ -40,6 +74,7 @@ pub struct PacketPool {
     reuses: AtomicU64,
     returned: AtomicU64,
     discarded: AtomicU64,
+    cached_bytes: AtomicUsize,
 }
 
 impl PacketPool {
@@ -53,6 +88,7 @@ impl PacketPool {
             reuses: AtomicU64::new(0),
             returned: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
+            cached_bytes: AtomicUsize::new(0),
         });
         let mut registry = packet_pool_registry()
             .lock()
@@ -66,6 +102,8 @@ impl PacketPool {
         let buffer = self.buffers.pop();
         let mut buffer = match buffer {
             Some(buffer) => {
+                self.cached_bytes
+                    .fetch_sub(buffer.capacity(), Ordering::Relaxed);
                 self.reuses.fetch_add(1, Ordering::Relaxed);
                 buffer
             }
@@ -100,6 +138,8 @@ impl PacketPool {
         let mut released = 0;
         while let Some(buffer) = self.buffers.pop() {
             released += buffer.capacity();
+            self.cached_bytes
+                .fetch_sub(buffer.capacity(), Ordering::Relaxed);
             self.discarded.fetch_add(1, Ordering::Relaxed);
         }
         released
@@ -112,6 +152,7 @@ impl PacketPool {
             returned: self.returned.load(Ordering::Relaxed),
             discarded: self.discarded.load(Ordering::Relaxed),
             cached: self.buffers.len(),
+            cached_bytes: self.cached_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -184,7 +225,10 @@ impl Drop for IpPacket {
             pool.discarded.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let capacity = buffer.capacity();
+        pool.cached_bytes.fetch_add(capacity, Ordering::Relaxed);
         if pool.buffers.push(buffer).is_err() {
+            pool.cached_bytes.fetch_sub(capacity, Ordering::Relaxed);
             pool.discarded.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -215,6 +259,7 @@ mod tests {
 
         let stats = pool.stats();
         assert_eq!(stats.cached, 2);
+        assert_eq!(stats.cached_bytes, 128);
         assert_eq!(stats.discarded, 1);
     }
 
@@ -248,5 +293,6 @@ mod tests {
 
         assert!(pool.trim() >= 64);
         assert_eq!(pool.stats().cached, 0);
+        assert_eq!(pool.stats().cached_bytes, 0);
     }
 }
