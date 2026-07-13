@@ -23,6 +23,7 @@ pub use packet::{
 pub use stack::{NetStack, StackEgress, StackIngress};
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;
+pub use tcp_stream_context::{tcp_runtime_stats, TcpRuntimeStats};
 pub use {udp::RecvHalf as UdpRecvHalf, udp::SendHalf as UdpSendHalf, udp::UdpPkt, udp::UdpSocket};
 
 #[derive(thiserror::Error, Debug)]

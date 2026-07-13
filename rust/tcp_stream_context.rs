@@ -3,18 +3,79 @@ use std::{
     cell::UnsafeCell,
     net::SocketAddr,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::packet::IpPacket;
 use super::LWIPMutexGuard;
 
+static ACTIVE_TCP_STREAMS: AtomicUsize = AtomicUsize::new(0);
+static TCP_QUEUED_PACKETS: AtomicUsize = AtomicUsize::new(0);
+static TCP_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpRuntimeStats {
+    pub active_streams: usize,
+    pub queued_packets: usize,
+    pub queued_bytes: usize,
+}
+
+pub fn tcp_runtime_stats() -> TcpRuntimeStats {
+    TcpRuntimeStats {
+        active_streams: ACTIVE_TCP_STREAMS.load(Ordering::Relaxed),
+        queued_packets: TCP_QUEUED_PACKETS.load(Ordering::Relaxed),
+        queued_bytes: TCP_QUEUED_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+pub struct QueuedTcpPacket {
+    packet: IpPacket,
+}
+
+impl QueuedTcpPacket {
+    pub fn new(packet: IpPacket) -> Self {
+        TCP_QUEUED_PACKETS.fetch_add(1, Ordering::Relaxed);
+        TCP_QUEUED_BYTES.fetch_add(packet.len(), Ordering::Relaxed);
+        Self { packet }
+    }
+}
+
+impl Deref for QueuedTcpPacket {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.packet
+    }
+}
+
+impl Drop for QueuedTcpPacket {
+    fn drop(&mut self) {
+        TCP_QUEUED_PACKETS.fetch_sub(1, Ordering::Relaxed);
+        TCP_QUEUED_BYTES.fetch_sub(self.packet.len(), Ordering::Relaxed);
+    }
+}
+
+pub struct ActiveTcpStream;
+
+impl ActiveTcpStream {
+    pub fn new() -> Self {
+        ACTIVE_TCP_STREAMS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveTcpStream {
+    fn drop(&mut self) {
+        ACTIVE_TCP_STREAMS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct TcpStreamContextInner {
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
-    pub read_tx: Option<UnboundedSender<IpPacket>>,
-    pub read_rx: UnboundedReceiver<IpPacket>,
+    pub read_tx: Option<UnboundedSender<QueuedTcpPacket>>,
+    pub read_rx: UnboundedReceiver<QueuedTcpPacket>,
     pub errored: bool,
     pub closed: bool,
     pub write_waker: Option<Waker>,
@@ -58,8 +119,8 @@ impl TcpStreamContext {
     pub fn new(
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
-        read_tx: UnboundedSender<IpPacket>,
-        read_rx: UnboundedReceiver<IpPacket>,
+        read_tx: UnboundedSender<QueuedTcpPacket>,
+        read_rx: UnboundedReceiver<QueuedTcpPacket>,
     ) -> Self {
         TcpStreamContext {
             inner: UnsafeCell::new(TcpStreamContextInner {

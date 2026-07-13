@@ -8,8 +8,8 @@ use tokio::{
 };
 
 use super::lwip::*;
-use super::packet::{IpPacket, PacketPool};
-use super::tcp_stream_context::TcpStreamContext;
+use super::packet::PacketPool;
+use super::tcp_stream_context::{ActiveTcpStream, QueuedTcpPacket, TcpStreamContext};
 use super::util;
 use super::LWIP_MUTEX;
 
@@ -40,7 +40,9 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
-        ctx.read_tx.as_ref().map(|tx| tx.send(Vec::new().into()));
+        ctx.read_tx
+            .as_ref()
+            .map(|tx| tx.send(QueuedTcpPacket::new(Vec::new().into())));
         return err_enum_t_ERR_OK as err_t;
     }
 
@@ -60,7 +62,9 @@ pub unsafe extern "C" fn tcp_recv_cb(
     packet.set_len(pbuflen as usize);
 
     if !packet.is_empty() {
-        ctx.read_tx.as_ref().map(|tx| tx.send(packet));
+        ctx.read_tx
+            .as_ref()
+            .map(|tx| tx.send(QueuedTcpPacket::new(packet)));
     }
 
     err_enum_t_ERR_OK as err_t
@@ -107,8 +111,9 @@ pub struct TcpStreamImpl {
     src_addr: SocketAddr,
     dest_addr: SocketAddr,
     pcb: usize,
-    read_buf: Option<(IpPacket, usize)>,
+    read_buf: Option<(QueuedTcpPacket, usize)>,
     callback_ctx: TcpStreamContext,
+    _active: ActiveTcpStream,
 }
 
 impl TcpStreamImpl {
@@ -141,6 +146,7 @@ impl TcpStreamImpl {
                 pcb: pcb as usize,
                 read_buf: None,
                 callback_ctx: TcpStreamContext::new(src_addr, dest_addr, read_tx, read_rx),
+                _active: ActiveTcpStream::new(),
             });
             let arg = &stream.callback_ctx as *const _;
             tcp_arg(pcb, arg as *mut raw::c_void);
