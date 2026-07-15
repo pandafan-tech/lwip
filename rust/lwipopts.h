@@ -98,7 +98,23 @@
 #define LWIP_CHKSUM_ALGORITHM 3
 
 #define TCP_MSS 1460
+
+// Receive-window sizing. Without window scaling lwIP can advertise at most
+// 64 KiB, which caps single-stream upload (client -> lwIP RX) throughput --
+// the kernel TCP stack that mihomo's mixed mode rides auto-tunes into the
+// megabytes. Desktop hosts get a scaled 128*MSS (~187 KiB) window; the
+// mobile hosts (iOS NE ~50 MiB jetsam cap, Android) keep the tight 32*MSS
+// unscaled window because per-connection RX buffering is bounded by the
+// advertised window and footprint is their primary axis. Global pbuf memory
+// stays capped by MEM_SIZE either way.
+#if (defined __APPLE__ && TARGET_OS_IPHONE) || defined __ANDROID__
 #define TCP_WND (32 * TCP_MSS)
+#else
+#define LWIP_WND_SCALE 1
+#define TCP_RCV_SCALE 2
+#define TCP_WND (128 * TCP_MSS)
+#endif
+
 #define TCP_SND_BUF (16 * TCP_MSS)
 
 #if defined __APPLE__
