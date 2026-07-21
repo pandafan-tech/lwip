@@ -93,7 +93,7 @@ impl UdpSocket {
         unsafe {
             let pcb = udp_new();
             let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
-            let packet_pool = PacketPool::new(buffer_size.min(256).max(1), 4 * 1024);
+            let packet_pool = PacketPool::new(buffer_size.clamp(1, 256), 4 * 1024);
             let socket = Box::new(Self {
                 pcb: pcb as usize,
                 waker: None,

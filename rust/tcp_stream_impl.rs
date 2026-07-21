@@ -145,7 +145,7 @@ impl TcpStreamImpl {
                 dest_addr,
                 pcb: pcb as usize,
                 read_buf: None,
-                callback_ctx: TcpStreamContext::new(src_addr, dest_addr, read_tx, read_rx),
+                callback_ctx: TcpStreamContext::new(src_addr, read_tx, read_rx),
                 _active: ActiveTcpStream::new(),
             });
             let arg = &stream.callback_ctx as *const _;
@@ -237,7 +237,7 @@ impl Drop for TcpStreamImpl {
     fn drop(&mut self) {
         let guard = LWIP_MUTEX.lock();
         let ctx = &*self.callback_ctx.with_lock(&guard);
-        trace!("netstack tcp drop {}", &ctx.local_addr);
+        trace!("netstack tcp drop {}", ctx.local_addr);
         if !ctx.errored {
             unsafe {
                 tcp_arg(self.pcb as *mut tcp_pcb, std::ptr::null_mut());
@@ -331,7 +331,7 @@ impl AsyncWrite for TcpStreamImpl {
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
         }
-        trace!("netstack tcp shutdown {}", &ctx.local_addr);
+        trace!("netstack tcp shutdown {}", ctx.local_addr);
         let err = unsafe { tcp_shutdown(self.pcb as *mut tcp_pcb, 0, 1) };
         if err != err_enum_t_ERR_OK as err_t {
             Poll::Ready(Err(io::Error::new(

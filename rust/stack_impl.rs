@@ -39,7 +39,7 @@ impl NetStackImpl {
 
         let (tx, rx): (Sender<IpPacket>, Receiver<IpPacket>) = channel(buffer_size);
         let output_pool = PacketPool::new(
-            buffer_size.min(OUTPUT_PACKET_CACHE).max(1),
+            buffer_size.clamp(1, OUTPUT_PACKET_CACHE),
             OUTPUT_PACKET_MAX_CAPACITY,
         );
 

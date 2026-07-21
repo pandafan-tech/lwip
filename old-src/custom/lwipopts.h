@@ -30,6 +30,15 @@
 #ifndef LWIP_CUSTOM_LWIPOPTS_H
 #define LWIP_CUSTOM_LWIPOPTS_H
 
+// Clang emits large tentative arrays as Mach-O common symbols and infers a
+// 32 KiB alignment that exceeds macOS's 16 KiB segment limit. These globals
+// are zero-initialized by definition, so make that explicit and keep them in
+// BSS with their actual lwIP alignment requirement.
+#if defined(__APPLE__)
+#define LWIP_DECLARE_MEMORY_ALIGNED(variable_name, size) \
+  u8_t variable_name[LWIP_MEM_ALIGN_BUFFER(size)] = {0}
+#endif
+
 // enable tun2socks logic
 #define TUN2SOCKS 1
 

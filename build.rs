@@ -123,8 +123,6 @@ fn generate_lwip_bindings() {
 }
 
 fn main() {
-    let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    println!("cargo:warning=host os {}", os);
     compile_lwip();
     generate_lwip_bindings();
     println!("cargo:rerun-if-changed=build.rs");

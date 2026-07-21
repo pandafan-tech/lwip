@@ -73,7 +73,6 @@ impl Drop for ActiveTcpStream {
 
 pub struct TcpStreamContextInner {
     pub local_addr: SocketAddr,
-    pub remote_addr: SocketAddr,
     pub read_tx: Option<UnboundedSender<QueuedTcpPacket>>,
     pub read_rx: UnboundedReceiver<QueuedTcpPacket>,
     pub errored: bool,
@@ -118,14 +117,12 @@ unsafe impl Sync for TcpStreamContext {}
 impl TcpStreamContext {
     pub fn new(
         local_addr: SocketAddr,
-        remote_addr: SocketAddr,
         read_tx: UnboundedSender<QueuedTcpPacket>,
         read_rx: UnboundedReceiver<QueuedTcpPacket>,
     ) -> Self {
         TcpStreamContext {
             inner: UnsafeCell::new(TcpStreamContextInner {
                 local_addr,
-                remote_addr,
                 read_tx: Some(read_tx),
                 read_rx,
                 errored: false,
