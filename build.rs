@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-fn sdk_include_path_for(sdk: &str) -> String {
+fn sdk_path_for(sdk: &str) -> String {
     // sdk path find by `xcrun --sdk {iphoneos|macosx} --show-sdk-path`
     let output = Command::new("xcrun")
         .arg("--sdk")
@@ -13,25 +13,67 @@ fn sdk_include_path_for(sdk: &str) -> String {
         .output()
         .expect("failed to execute xcrun");
 
-    let inc_path = Path::new(String::from_utf8_lossy(&output.stdout).trim()).join("usr/include");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
 
+fn sdk_include_path_for(sdk: &str) -> String {
+    let sdk_path = sdk_path_for(sdk);
+    let inc_path = Path::new(&sdk_path).join("usr/include");
     inc_path.to_str().expect("invalid include path").to_string()
 }
 
 fn sdk_include_path() -> Option<String> {
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target = env::var("TARGET").unwrap();
     match os.as_str() {
         "ios" => {
-            if arch == "x86_64" {
+            if arch == "x86_64" || target.ends_with("-sim") {
                 Some(sdk_include_path_for("iphonesimulator"))
             } else {
                 Some(sdk_include_path_for("iphoneos"))
             }
         }
+        "tvos" => {
+            if target.ends_with("-sim") {
+                Some(sdk_include_path_for("appletvsimulator"))
+            } else {
+                Some(sdk_include_path_for("appletvos"))
+            }
+        }
         "macos" => Some(sdk_include_path_for("macosx")),
         _ => None,
     }
+}
+
+fn apple_clang_target() -> Option<String> {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let arch = match arch.as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => return None,
+    };
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target = env::var("TARGET").unwrap();
+    let simulator = target.ends_with("-sim");
+    let (platform, deployment_target) = match os.as_str() {
+        "ios" => (
+            "ios",
+            env::var("IPHONEOS_DEPLOYMENT_TARGET")
+                .expect("IPHONEOS_DEPLOYMENT_TARGET must be set for iOS builds"),
+        ),
+        "tvos" => (
+            "tvos",
+            env::var("TVOS_DEPLOYMENT_TARGET")
+                .expect("TVOS_DEPLOYMENT_TARGET must be set for tvOS builds"),
+        ),
+        _ => return None,
+    };
+
+    Some(format!(
+        "{arch}-apple-{platform}{deployment_target}{}",
+        if simulator { "-simulator" } else { "" }
+    ))
 }
 
 fn compile_lwip() {
@@ -82,6 +124,15 @@ fn compile_lwip() {
     if let Some(sdk_include_path) = sdk_include_path() {
         build.include(sdk_include_path);
     }
+    let target = env::var("TARGET").unwrap();
+    if target == "aarch64-apple-tvos-sim" {
+        let clang_target = apple_clang_target().unwrap();
+        build
+            .target("aarch64-apple-tvos")
+            .flag(&format!("--target={clang_target}"))
+            .flag("-isysroot")
+            .flag(&sdk_path_for("appletvsimulator"));
+    }
     build.debug(true);
     build.compile("liblwip.a");
 }
@@ -93,7 +144,6 @@ fn generate_lwip_bindings() {
 
     let sdk_include_path = sdk_include_path();
 
-    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let mut builder = bindgen::Builder::default()
         .header("old-src/custom/wrapper.h")
@@ -102,9 +152,9 @@ fn generate_lwip_bindings() {
         .clang_arg("-Wno-everything")
         .layout_tests(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
-    if arch == "aarch64" && os == "ios" {
+    if let Some(target) = apple_clang_target() {
         // https://github.com/rust-lang/rust-bindgen/issues/1211
-        builder = builder.clang_arg("--target=arm64-apple-ios");
+        builder = builder.clang_arg(format!("--target={target}"));
     }
     if let Some(sdk_include_path) = sdk_include_path {
         builder = builder.clang_arg(format!("-I{}", sdk_include_path));
