@@ -50,6 +50,9 @@
 #define ARP_QUEUEING 0
 #define IP_FORWARD 0
 #define LWIP_ICMP 1
+// Custom ingress uses PBUF_REF. ICMP echo must copy when the external payload
+// cannot reveal the stripped IPv4 header for an in-place reply.
+#define LWIP_ICMP_ECHO_CHECK_INPUT_PBUF_LEN 1
 #define LWIP_RAW 1
 #define LWIP_DHCP 0
 #define LWIP_AUTOIP 0

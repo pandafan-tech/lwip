@@ -1,14 +1,16 @@
 use futures::task::Waker;
 use std::{
     cell::UnsafeCell,
+    collections::VecDeque,
     net::SocketAddr,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::packet::IpPacket;
 use super::LWIPMutexGuard;
+
+const TCP_READ_QUEUE_INITIAL_CAPACITY: usize = 32;
 
 static ACTIVE_TCP_STREAMS: AtomicUsize = AtomicUsize::new(0);
 static TCP_QUEUED_PACKETS: AtomicUsize = AtomicUsize::new(0);
@@ -73,8 +75,9 @@ impl Drop for ActiveTcpStream {
 
 pub struct TcpStreamContextInner {
     pub local_addr: SocketAddr,
-    pub read_tx: Option<UnboundedSender<QueuedTcpPacket>>,
-    pub read_rx: UnboundedReceiver<QueuedTcpPacket>,
+    pub read_queue: VecDeque<QueuedTcpPacket>,
+    pub read_waker: Option<Waker>,
+    pub read_eof: bool,
     pub errored: bool,
     pub closed: bool,
     pub write_waker: Option<Waker>,
@@ -115,16 +118,13 @@ pub struct TcpStreamContext {
 unsafe impl Sync for TcpStreamContext {}
 
 impl TcpStreamContext {
-    pub fn new(
-        local_addr: SocketAddr,
-        read_tx: UnboundedSender<QueuedTcpPacket>,
-        read_rx: UnboundedReceiver<QueuedTcpPacket>,
-    ) -> Self {
+    pub fn new(local_addr: SocketAddr) -> Self {
         TcpStreamContext {
             inner: UnsafeCell::new(TcpStreamContextInner {
                 local_addr,
-                read_tx: Some(read_tx),
-                read_rx,
+                read_queue: VecDeque::with_capacity(TCP_READ_QUEUE_INITIAL_CAPACITY),
+                read_waker: None,
+                read_eof: false,
                 errored: false,
                 closed: false,
                 write_waker: None,

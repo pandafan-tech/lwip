@@ -2,10 +2,7 @@ use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin, sync::Arc, sync::Onc
 
 use futures::task::{Context, Poll};
 use log::*;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::mpsc::unbounded_channel,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::lwip::*;
 use super::packet::PacketPool;
@@ -40,9 +37,10 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
-        ctx.read_tx
-            .as_ref()
-            .map(|tx| tx.send(QueuedTcpPacket::new(Vec::new().into())));
+        ctx.read_eof = true;
+        if let Some(waker) = ctx.read_waker.take() {
+            waker.wake();
+        }
         return err_enum_t_ERR_OK as err_t;
     }
 
@@ -62,9 +60,10 @@ pub unsafe extern "C" fn tcp_recv_cb(
     packet.set_len(pbuflen as usize);
 
     if !packet.is_empty() {
-        ctx.read_tx
-            .as_ref()
-            .map(|tx| tx.send(QueuedTcpPacket::new(packet)));
+        ctx.read_queue.push_back(QueuedTcpPacket::new(packet));
+        if let Some(waker) = ctx.read_waker.take() {
+            waker.wake();
+        }
     }
 
     err_enum_t_ERR_OK as err_t
@@ -91,7 +90,9 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     let ctx = &mut *unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
     trace!("netstack tcp err {} {}", err, ctx.local_addr);
     ctx.errored = true;
-    let _ = ctx.read_tx.take();
+    if let Some(waker) = ctx.read_waker.take() {
+        waker.wake();
+    }
     if let Some(waker) = ctx.write_waker.as_ref() {
         waker.wake_by_ref();
     }
@@ -119,14 +120,11 @@ pub struct TcpStreamImpl {
 impl TcpStreamImpl {
     pub fn new(pcb: *mut tcp_pcb) -> Box<Self> {
         unsafe {
-            // Since we have no idea how to deal with a full bounded channel upon receiving
-            // data from lwIP, an unbounded channel is used instead.
-            //
-            // Note that lwIP is in charge of flow control. If reader is slower than writer,
-            // lwIP will propagate the pressure back by announcing a decreased window size.
-            // Thus our unbounded channel will never be overwhelmed. To achieve this, we must
-            // call `tcp_recved` when the data from our internal buffer are consumed.
-            let (read_tx, read_rx) = unbounded_channel();
+            // The receive callback and AsyncRead consumer both run under
+            // LWIP_MUTEX, so a direct queue avoids the redundant atomics and
+            // per-packet wake path of a thread-safe channel. lwIP owns flow
+            // control: we only call tcp_recved after the Rust consumer has
+            // actually copied bytes out of this queue.
             let mut remote_ip = std::mem::zeroed();
             let mut remote_port = 0;
             let mut local_ip = std::mem::zeroed();
@@ -145,7 +143,7 @@ impl TcpStreamImpl {
                 dest_addr,
                 pcb: pcb as usize,
                 read_buf: None,
-                callback_ctx: TcpStreamContext::new(src_addr, read_tx, read_rx),
+                callback_ctx: TcpStreamContext::new(src_addr),
                 _active: ActiveTcpStream::new(),
             });
             let arg = &stream.callback_ctx as *const _;
@@ -195,41 +193,54 @@ impl AsyncRead for TcpStreamImpl {
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
         }
-        let mut has_read_data = false;
-        loop {
-            if let Some((data, offset)) = me.read_buf.as_mut() {
-                let to_read = min(buf.remaining(), data.len() - *offset);
-                buf.put_slice(&data[*offset..*offset + to_read]);
-                *offset += to_read;
-                if *offset == data.len() {
-                    me.read_buf.take();
-                }
-                return Poll::Ready(Ok(()));
+
+        let mut consumed = 0usize;
+        let result = loop {
+            if buf.remaining() == 0 {
+                break Poll::Ready(Ok(()));
             }
-            match Pin::new(&mut ctx.read_rx).poll_recv(cx) {
-                Poll::Ready(Some(data)) => {
-                    if data.is_empty() {
-                        return Poll::Ready(Ok(()));
+
+            if me.read_buf.is_none() {
+                if let Some(data) = ctx.read_queue.pop_front() {
+                    me.read_buf = Some((data, 0));
+                } else if ctx.read_eof || consumed > 0 {
+                    break Poll::Ready(Ok(()));
+                } else {
+                    let should_replace = ctx
+                        .read_waker
+                        .as_ref()
+                        .map(|waker| !waker.will_wake(cx.waker()))
+                        .unwrap_or(true);
+                    if should_replace {
+                        ctx.read_waker = Some(cx.waker().clone());
                     }
-                    unsafe { tcp_recved(me.pcb as *mut tcp_pcb, data.len() as u16_t) };
-                    let to_read = min(buf.remaining(), data.len());
-                    buf.put_slice(&data[..to_read]);
-                    has_read_data = true;
-                    if to_read < data.len() {
-                        me.read_buf = Some((data, to_read));
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                Poll::Ready(None) => return Poll::Ready(Err(broken_pipe())),
-                Poll::Pending => {
-                    return if has_read_data {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Pending
-                    };
+                    break Poll::Pending;
                 }
             }
+
+            let (data, offset) = me
+                .read_buf
+                .as_mut()
+                .expect("TCP read buffer is present after dequeue");
+            let to_read = min(buf.remaining(), data.len() - *offset);
+            buf.put_slice(&data[*offset..*offset + to_read]);
+            *offset += to_read;
+            consumed += to_read;
+            if *offset == data.len() {
+                me.read_buf.take();
+            }
+        };
+
+        let mut unacknowledged = consumed;
+        while unacknowledged > 0 {
+            let acknowledged = unacknowledged.min(u16::MAX as usize);
+            unsafe {
+                tcp_recved(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
+            }
+            unacknowledged -= acknowledged;
         }
+
+        result
     }
 }
 

@@ -8,11 +8,76 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use super::lwip::*;
 use super::output::{output_ip4, output_ip6, OUTPUT_CB_PTR};
 use super::packet::{IpPacket, PacketPool, PacketPoolStats};
-use super::LWIP_MUTEX;
+use super::{LWIPMutexGuard, LWIP_MUTEX};
 
 static LWIP_INIT: Once = Once::new();
 const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
+const _: () = assert!(MEM_ALIGNMENT == 1);
+
+#[repr(C)]
+struct OwnedInputPbuf {
+    custom: pbuf_custom,
+    packet: Vec<u8>,
+}
+
+unsafe extern "C" fn release_owned_input_pbuf(pbuf: *mut pbuf) {
+    // SAFETY: OwnedInputPbuf is repr(C), `custom` is its first field, and
+    // bindgen's repr(C) pbuf_custom has `pbuf` as its first field. Therefore
+    // the pbuf pointer returned by pbuf_alloced_custom is also the original
+    // Box allocation pointer. lwIP invokes this callback exactly once when
+    // the custom pbuf's final reference is released.
+    drop(unsafe { Box::from_raw(pbuf.cast::<OwnedInputPbuf>()) });
+}
+
+fn input_owned_packet_locked(packet: Vec<u8>, _guard: &LWIPMutexGuard<'_>) -> err_t {
+    let Ok(length) = u16_t::try_from(packet.len()) else {
+        log::warn!(
+            "input frame exceeds the lwIP pbuf length limit: {} bytes",
+            packet.len()
+        );
+        return err_enum_t_ERR_BUF as err_t;
+    };
+
+    let custom = pbuf_custom {
+        pbuf: unsafe { std::mem::zeroed() },
+        custom_free_function: Some(release_owned_input_pbuf),
+    };
+    let mut owned = Box::new(OwnedInputPbuf { custom, packet });
+    let pbuf = unsafe {
+        pbuf_alloced_custom(
+            pbuf_layer_PBUF_RAW,
+            length,
+            pbuf_type_PBUF_REF,
+            &mut owned.custom,
+            owned.packet.as_mut_ptr().cast::<raw::c_void>(),
+            length,
+        )
+    };
+    if pbuf.is_null() {
+        // PBUF_RAW has no header offset and payload_mem_len equals length, so
+        // this indicates an ABI/configuration mismatch rather than pressure:
+        // pbuf_alloced_custom itself performs no allocation.
+        log::error!("pbuf_alloced_custom rejected a correctly sized PBUF_RAW frame");
+        return err_enum_t_ERR_BUF as err_t;
+    }
+
+    let owned_ptr = Box::into_raw(owned);
+    debug_assert_eq!(pbuf.cast::<OwnedInputPbuf>(), owned_ptr);
+
+    // ERR_OK transfers ownership to lwIP. The IP/TCP/UDP path either releases
+    // the pbuf during this call or retains a reference and invokes the custom
+    // free callback later.
+    let err = unsafe { lwip_rs_netif_input(pbuf) };
+    if err != err_enum_t_ERR_OK as err_t {
+        // A rejected input has not consumed the caller's reference.
+        unsafe {
+            pbuf_free(pbuf);
+        }
+        log::warn!("netif input rejected frame: {}", err);
+    }
+    err
+}
 
 pub struct NetStackImpl {
     tx: Sender<IpPacket>,
@@ -98,33 +163,12 @@ impl NetStackImpl {
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
-        let _g = LWIP_MUTEX.lock();
+        let guard = LWIP_MUTEX.lock();
         for item in items {
             if item.is_empty() {
                 continue;
             }
-            unsafe {
-                let pbuf = pbuf_alloc(pbuf_layer_PBUF_RAW, item.len() as u16_t, pbuf_type_PBUF_RAM);
-                if pbuf.is_null() {
-                    // lwIP heap exhaustion: an IP device may drop frames under
-                    // memory pressure — the sender retransmits.
-                    log::warn!(
-                        "pbuf_alloc failed (heap exhausted), dropping {} byte frame",
-                        item.len()
-                    );
-                    continue;
-                }
-                pbuf_take(
-                    pbuf,
-                    item.as_ptr() as *const raw::c_void,
-                    item.len() as u16_t,
-                );
-                let err = lwip_rs_netif_input(pbuf);
-                if err != err_enum_t_ERR_OK as err_t {
-                    pbuf_free(pbuf);
-                    log::warn!("netif input rejected frame: {}", err);
-                }
-            }
+            let _ = input_owned_packet_locked(item, &guard);
         }
     }
 
@@ -201,40 +245,12 @@ impl Sink<Vec<u8>> for NetStackImpl {
             if item.is_empty() {
                 return Poll::Ready(Ok(()));
             }
-            unsafe {
-                let _g = LWIP_MUTEX.lock();
-
-                let pbuf = pbuf_alloc(pbuf_layer_PBUF_RAW, item.len() as u16_t, pbuf_type_PBUF_RAM);
-                if pbuf.is_null() {
-                    // lwIP heap exhaustion. Returning Pending here without
-                    // registering a waker would park the Sink future forever
-                    // (nothing ever re-polls it), deadlocking the netstack
-                    // driver task that owns both ingress and egress. An IP
-                    // device is allowed to drop frames under memory pressure
-                    // — the sender retransmits — so drop and report success.
-                    log::warn!(
-                        "pbuf_alloc failed (heap exhausted), dropping {} byte frame",
-                        item.len()
-                    );
-                    return Poll::Ready(Ok(()));
-                }
-                pbuf_take(
-                    pbuf,
-                    item.as_ptr() as *const raw::c_void,
-                    item.len() as u16_t,
-                );
-
-                let err = lwip_rs_netif_input(pbuf);
-                if err != err_enum_t_ERR_OK as err_t {
-                    // A rejected frame is a per-packet event (e.g. ERR_MEM
-                    // mid-burst), not a stack-fatal one. Drop it instead of
-                    // erroring the Sink: callers treat a Sink error as
-                    // fatal and tear down the whole packet path.
-                    pbuf_free(pbuf);
-                    log::warn!("netif input rejected frame: {}", err);
-                }
-                Poll::Ready(Ok(()))
-            }
+            let guard = LWIP_MUTEX.lock();
+            let _ = input_owned_packet_locked(item, &guard);
+            // A rejected frame is a per-packet event, not a stack-fatal one.
+            // Callers treat a Sink error as fatal and tear down the packet
+            // path, so preserve the IP-device behavior of dropping it.
+            Poll::Ready(Ok(()))
         } else {
             Poll::Ready(Ok(()))
         }
@@ -243,4 +259,43 @@ impl Sink<Vec<u8>> for NetStackImpl {
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NetifListRestore(*mut netif);
+
+    impl Drop for NetifListRestore {
+        fn drop(&mut self) {
+            unsafe {
+                netif_list = self.0;
+            }
+        }
+    }
+
+    #[test]
+    fn netif_rejection_is_reported_without_panicking() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let stack = NetStackImpl::new(1);
+                {
+                    let guard = LWIP_MUTEX.lock();
+                    let previous = unsafe { netif_list };
+                    let _restore = NetifListRestore(previous);
+                    unsafe {
+                        netif_list = std::ptr::null_mut();
+                    }
+
+                    let err = input_owned_packet_locked(vec![0x45; 20], &guard);
+                    assert_eq!(err, err_enum_t_ERR_IF as err_t);
+                }
+                drop(stack);
+            });
+    }
+
 }
