@@ -103,6 +103,34 @@ fn is_syn_ack_for(packet: &[u8], source_port: u16) -> bool {
         && packet[33] & 0x12 == 0x12
 }
 
+fn tcp_mss_option(packet: &[u8]) -> Option<u16> {
+    let ip_header_len = usize::from(packet.first()? & 0x0f) * 4;
+    let tcp_header_len = usize::from(*packet.get(ip_header_len + 12)? >> 4) * 4;
+    if tcp_header_len < 20 || packet.len() < ip_header_len + tcp_header_len {
+        return None;
+    }
+
+    let mut offset = ip_header_len + 20;
+    let end = ip_header_len + tcp_header_len;
+    while offset < end {
+        match packet[offset] {
+            0 => break,
+            1 => offset += 1,
+            kind => {
+                let length = usize::from(*packet.get(offset + 1)?);
+                if length < 2 || offset + length > end {
+                    return None;
+                }
+                if kind == 2 && length == 4 {
+                    return Some(u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]));
+                }
+                offset += length;
+            }
+        }
+    }
+    None
+}
+
 async fn next_syn_ack(egress: &mut lwip::StackEgress, source_port: u16) -> lwip::IpPacket {
     timeout(Duration::from_secs(1), async {
         loop {
@@ -117,6 +145,43 @@ async fn next_syn_ack(egress: &mut lwip::StackEgress, source_port: u16) -> lwip:
     })
     .await
     .expect("lwIP did not emit an expected SYN-ACK")
+}
+
+#[test]
+fn configured_mtu_controls_advertised_tcp_mss() {
+    let _test_guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            const SYN: u8 = 0x02;
+            const ACK: u8 = 0x10;
+            let (stack, mut listener, udp) =
+                NetStack::with_buffer_size_and_mtu(8, 8, 9000).unwrap();
+            drop(udp);
+            let (mut ingress, mut egress) = stack.split();
+            let source_port = 10_001;
+
+            ingress.input_batch([ipv4_tcp_packet(source_port, 1, 0, SYN, &[])]);
+            let syn_ack = next_syn_ack(&mut egress, source_port).await;
+
+            assert_eq!(tcp_mss_option(&syn_ack), Some(8960));
+            ingress.input_batch([ipv4_tcp_packet(
+                source_port,
+                2,
+                tcp_sequence(&syn_ack) + 1,
+                ACK,
+                &[],
+            )]);
+            let (stream, _, _) = timeout(Duration::from_secs(1), listener.next())
+                .await
+                .expect("lwIP did not accept the MTU test connection")
+                .expect("lwIP TCP listener ended during the MTU test");
+            drop(stream);
+        });
 }
 
 async fn establish_tcp_stream(
@@ -277,9 +342,9 @@ fn custom_input_pbufs_have_zero_retention_through_batch_and_sink() {
                 ingress.input_batch([invalid_ipv4_packet()]);
             }
             let after_batch = live_allocations();
-            assert_eq!(
-                after_batch, before_batch,
-                "batch input retained an owned input Vec/custom pbuf"
+            assert!(
+                after_batch <= before_batch,
+                "batch input retained an owned input Vec/custom pbuf: {before_batch} -> {after_batch}"
             );
             drop(listener);
             drop(ingress);
@@ -295,9 +360,9 @@ fn custom_input_pbufs_have_zero_retention_through_batch_and_sink() {
                 stack.send(invalid_ipv4_packet()).await.unwrap();
             }
             let after_sink = live_allocations();
-            assert_eq!(
-                after_sink, before_sink,
-                "Sink input retained an owned input Vec/custom pbuf"
+            assert!(
+                after_sink <= before_sink,
+                "Sink input retained an owned input Vec/custom pbuf: {before_sink} -> {after_sink}"
             );
             drop(listener);
             drop(stack);

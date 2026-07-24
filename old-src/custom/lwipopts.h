@@ -106,21 +106,31 @@
 #define LWIP_CHECKSUM_ON_COPY 1
 #define LWIP_CHKSUM_ALGORITHM 3
 
-#define TCP_MSS 1460
+#define PANDA_BASE_TCP_MSS 1460
+// Compile for the largest MSS used by the default desktop TUN MTU (9000).
+// The effective MSS is still capped at runtime by netif->mtu, so mobile and
+// 1500-byte TUNs continue to advertise 1460.
+#define TCP_MSS 8960
 #if defined __APPLE__ && TARGET_OS_IPHONE
 // Network Extension has a tight process-memory ceiling. Keep the mobile
 // receive/send budget conservative; the device-side TUN RTT is tiny.
-#define TCP_WND (32 * TCP_MSS)
-#define TCP_SND_BUF (16 * TCP_MSS)
-#else
-// Desktop and Android have a larger packet-stack memory budget. Advertise the
-// same 46,720-byte unscaled window with a x4 scale factor, allowing the receive
-// side to grow to 186,880 bytes when the relay keeps up.
+#define TCP_WND (32 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (16 * PANDA_BASE_TCP_MSS)
+#elif defined __ANDROID__
 #define LWIP_WND_SCALE 1
 #define TCP_RCV_SCALE 2
-#define TCP_WND (128 * TCP_MSS)
-#define TCP_SND_BUF (64 * TCP_MSS)
+#define TCP_WND (128 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
+#else
+// Desktop system TCP stacks auto-tune into much larger windows. Keep PandaCore
+// at the kernel's 256 KiB congestion-window scale without increasing either
+// mobile platform's per-flow memory budget.
+#define LWIP_WND_SCALE 1
+#define TCP_RCV_SCALE 3
+#define TCP_WND (256 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
 #endif
+#define TCP_SNDLOWAT (2 * PANDA_BASE_TCP_MSS)
 
 #if defined __APPLE__
 #include <TargetConditionals.h>

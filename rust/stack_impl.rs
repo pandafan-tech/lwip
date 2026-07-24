@@ -11,6 +11,7 @@ use super::packet::{IpPacket, PacketPool, PacketPoolStats};
 use super::{LWIPMutexGuard, LWIP_MUTEX};
 
 static LWIP_INIT: Once = Once::new();
+const DEFAULT_MTU: u16 = 1500;
 const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
 const _: () = assert!(MEM_ALIGNMENT == 1);
@@ -98,9 +99,13 @@ pub struct NetStackImpl {
 
 impl NetStackImpl {
     pub fn new(buffer_size: usize) -> Box<Self> {
+        Self::new_with_mtu(buffer_size, DEFAULT_MTU)
+    }
+
+    pub(crate) fn new_with_mtu(buffer_size: usize, mtu: u16) -> Box<Self> {
         LWIP_INIT.call_once(|| unsafe { lwip_init() });
 
-        unsafe { lwip_rs_configure_netif(Some(output_ip4), Some(output_ip6), 1500) };
+        unsafe { lwip_rs_configure_netif(Some(output_ip4), Some(output_ip6), mtu) };
 
         let (tx, rx): (Sender<IpPacket>, Receiver<IpPacket>) = channel(buffer_size);
         let output_pool = PacketPool::new(
@@ -297,5 +302,4 @@ mod tests {
                 drop(stack);
             });
     }
-
 }

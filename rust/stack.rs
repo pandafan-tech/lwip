@@ -32,6 +32,18 @@ impl NetStack {
         ))
     }
 
+    pub fn with_buffer_size_and_mtu(
+        stack_buffer_size: usize,
+        udp_buffer_size: usize,
+        mtu: u16,
+    ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
+        Ok((
+            NetStack(NetStackImpl::new_with_mtu(stack_buffer_size, mtu)),
+            TcpListener::new()?,
+            UdpSocket::new(udp_buffer_size)?,
+        ))
+    }
+
     /// Split into an ingress half (batch input into lwIP) and an egress half
     /// (a plain channel of packets leaving lwIP). The two halves can be
     /// driven from different tasks so TUN read and TUN write directions no

@@ -74,10 +74,10 @@ pub extern "C" fn tcp_sent_cb(arg: *mut raw::c_void, tpcb: *mut tcp_pcb, len: u1
     // SAFETY: tcp_sent_cb is called from tcp_input only when
     // an ACK packet is received. Thus lwip_mutex must be locked.
     // See also `<NetStackImpl as AsyncWrite>::poll_write`.
-    let ctx = &*unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
+    let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
     // trace!("netstack tcp sent {}", &ctx.local_addr);
-    if let Some(waker) = ctx.write_waker.as_ref() {
-        waker.wake_by_ref();
+    if let Some(waker) = ctx.write_waker.take() {
+        waker.wake();
     }
     err_enum_t_ERR_OK as err_t
 }
@@ -93,17 +93,17 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     if let Some(waker) = ctx.read_waker.take() {
         waker.wake();
     }
-    if let Some(waker) = ctx.write_waker.as_ref() {
-        waker.wake_by_ref();
+    if let Some(waker) = ctx.write_waker.take() {
+        waker.wake();
     }
 }
 
 #[allow(unused_variables)]
 pub extern "C" fn tcp_poll_cb(arg: *mut ::std::os::raw::c_void, tpcb: *mut tcp_pcb) -> err_t {
-    let ctx = &*unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
+    let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
     // trace!("netstack tcp poll {}", &ctx.local_addr);
-    if let Some(waker) = ctx.write_waker.as_ref() {
-        waker.wake_by_ref();
+    if let Some(waker) = ctx.write_waker.take() {
+        waker.wake();
     }
     err_enum_t_ERR_OK as err_t
 }
@@ -353,5 +353,44 @@ impl AsyncWrite for TcpStreamImpl {
             ctx.closed = true;
             Poll::Ready(Ok(()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn tcp_sent_consumes_the_registered_write_waker() {
+        let context = TcpStreamContext::new("127.0.0.1:1234".parse().unwrap());
+        let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        {
+            let guard = LWIP_MUTEX.lock();
+            context.with_lock(&guard).write_waker = Some(Waker::from(Arc::clone(&wake_counter)));
+        }
+
+        let _guard = LWIP_MUTEX.lock();
+        let context_ptr = std::ptr::from_ref(&context).cast_mut().cast();
+        tcp_sent_cb(context_ptr, std::ptr::null_mut(), 1);
+        tcp_sent_cb(context_ptr, std::ptr::null_mut(), 1);
+
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+        assert!(unsafe { TcpStreamContext::assume_locked(&context) }
+            .write_waker
+            .is_none());
     }
 }

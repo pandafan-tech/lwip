@@ -78,6 +78,7 @@ fn apple_clang_target() -> Option<String> {
 
 fn compile_lwip() {
     println!("cargo:rerun-if-changed=old-src/core");
+    println!("cargo:rerun-if-changed=old-src/custom");
     let mut build = cc::Build::new();
     build
         .file("old-src/core/init.c")

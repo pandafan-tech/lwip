@@ -109,25 +109,35 @@
 #define LWIP_CHECKSUM_ON_COPY 1
 #define LWIP_CHKSUM_ALGORITHM 3
 
-#define TCP_MSS 1460
+#define PANDA_BASE_TCP_MSS 1460
+// Compile for the largest MSS used by the default desktop TUN MTU (9000).
+// The effective MSS is still capped at runtime by netif->mtu, so mobile and
+// 1500-byte TUNs continue to advertise 1460.
+#define TCP_MSS 8960
 
 // Receive-window sizing. Without window scaling lwIP can advertise at most
 // 64 KiB, which caps single-stream upload (client -> lwIP RX) throughput --
 // the kernel TCP stack that mihomo's mixed mode rides auto-tunes into the
-// megabytes. Desktop hosts get a scaled 128*MSS (~187 KiB) window; the
-// mobile hosts (iOS NE ~50 MiB jetsam cap, Android) keep the tight 32*MSS
-// unscaled window because per-connection RX buffering is bounded by the
-// advertised window and footprint is their primary axis. Global pbuf memory
-// stays capped by MEM_SIZE either way.
-#if (defined __APPLE__ && TARGET_OS_IPHONE) || defined __ANDROID__
-#define TCP_WND (32 * TCP_MSS)
-#else
+// megabytes. iOS NE keeps the tight 32*base-MSS unscaled window because its
+// process has a strict memory ceiling. Android retains the existing
+// 128*base-MSS budget; desktop hosts use 256*base-MSS to match kernel
+// congestion-window scale.
+#if defined __APPLE__ && TARGET_OS_IPHONE
+#define TCP_WND (32 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (16 * PANDA_BASE_TCP_MSS)
+#elif defined __ANDROID__
 #define LWIP_WND_SCALE 1
 #define TCP_RCV_SCALE 2
-#define TCP_WND (128 * TCP_MSS)
+#define TCP_WND (128 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
+#else
+#define LWIP_WND_SCALE 1
+#define TCP_RCV_SCALE 3
+#define TCP_WND (256 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
 #endif
 
-#define TCP_SND_BUF (16 * TCP_MSS)
+#define TCP_SNDLOWAT (2 * PANDA_BASE_TCP_MSS)
 
 #if defined __APPLE__
 #include <TargetConditionals.h>
