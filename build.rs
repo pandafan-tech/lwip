@@ -77,49 +77,51 @@ fn apple_clang_target() -> Option<String> {
 }
 
 fn compile_lwip() {
-    println!("cargo:rerun-if-changed=old-src/core");
-    println!("cargo:rerun-if-changed=old-src/custom");
+    println!("cargo:rerun-if-changed=src/core");
+    println!("cargo:rerun-if-changed=src/include");
+    println!("cargo:rerun-if-changed=port");
     let mut build = cc::Build::new();
     build
-        .file("old-src/core/init.c")
-        .file("old-src/core/def.c")
-        // .file("old-src/core/dns.c")
-        .file("old-src/core/inet_chksum.c")
-        .file("old-src/core/ip.c")
-        .file("old-src/core/mem.c")
-        .file("old-src/core/memp.c")
-        .file("old-src/core/netif.c")
-        .file("old-src/core/pbuf.c")
-        .file("old-src/core/raw.c")
-        // .file("old-src/core/stats.c")
-        // .file("old-src/core/sys.c")
-        .file("old-src/core/tcp.c")
-        .file("old-src/core/tcp_in.c")
-        .file("old-src/core/tcp_out.c")
-        .file("old-src/core/timeouts.c")
-        .file("old-src/core/udp.c")
-        // .file("old-src/core/ipv4/autoip.c")
-        // .file("old-src/core/ipv4/dhcp.c")
-        // .file("old-src/core/ipv4/etharp.c")
-        .file("old-src/core/ipv4/icmp.c")
-        // .file("old-src/core/ipv4/igmp.c")
-        .file("old-src/core/ipv4/ip4_frag.c")
-        .file("old-src/core/ipv4/ip4.c")
-        .file("old-src/core/ipv4/ip4_addr.c")
-        // .file("old-src/core/ipv6/dhcp6.c")
-        // .file("old-src/core/ipv6/ethip6.c")
-        .file("old-src/core/ipv6/icmp6.c")
-        // .file("old-src/core/ipv6/inet6.c")
-        .file("old-src/core/ipv6/ip6.c")
-        .file("old-src/core/ipv6/ip6_addr.c")
-        .file("old-src/core/ipv6/ip6_frag.c")
-        // .file("old-src/core/ipv6/mld6.c")
-        .file("old-src/core/ipv6/nd6.c")
-        .file("old-src/custom/sys_arch.c")
-        .file("old-src/custom/rust_accessors.c")
+        .file("src/core/init.c")
+        .file("src/core/def.c")
+        // .file("src/core/dns.c")
+        .file("src/core/inet_chksum.c")
+        .file("src/core/ip.c")
+        .file("src/core/mem.c")
+        .file("src/core/memp.c")
+        .file("src/core/netif.c")
+        .file("src/core/pbuf.c")
+        .file("src/core/raw.c")
+        // .file("src/core/stats.c")
+        // .file("src/core/sys.c")
+        .file("src/core/tcp.c")
+        .file("src/core/tcp_in.c")
+        .file("src/core/tcp_out.c")
+        .file("src/core/timeouts.c")
+        .file("src/core/udp.c")
+        .file("src/core/ipv4/acd.c")
+        // .file("src/core/ipv4/autoip.c")
+        // .file("src/core/ipv4/dhcp.c")
+        // .file("src/core/ipv4/etharp.c")
+        .file("src/core/ipv4/icmp.c")
+        // .file("src/core/ipv4/igmp.c")
+        .file("src/core/ipv4/ip4_frag.c")
+        .file("src/core/ipv4/ip4.c")
+        .file("src/core/ipv4/ip4_addr.c")
+        // .file("src/core/ipv6/dhcp6.c")
+        // .file("src/core/ipv6/ethip6.c")
+        .file("src/core/ipv6/icmp6.c")
+        // .file("src/core/ipv6/inet6.c")
+        .file("src/core/ipv6/ip6.c")
+        .file("src/core/ipv6/ip6_addr.c")
+        .file("src/core/ipv6/ip6_frag.c")
+        // .file("src/core/ipv6/mld6.c")
+        .file("src/core/ipv6/nd6.c")
+        .file("port/sys_arch.c")
+        .file("port/rust_accessors.c")
         .file("src/api/err.c")
-        .include("old-src/custom")
-        .include("old-src/include")
+        .include("port")
+        .include("src/include")
         .warnings(false)
         .flag_if_supported("-Wno-everything");
     if let Some(sdk_include_path) = sdk_include_path() {
@@ -140,16 +142,15 @@ fn compile_lwip() {
 
 fn generate_lwip_bindings() {
     println!("cargo:rustc-link-lib=lwip");
-    // println!("cargo:rerun-if-changed=old-src/custom/wrapper.h");
-    println!("cargo:include=old-src/include");
+    println!("cargo:include=src/include");
 
     let sdk_include_path = sdk_include_path();
 
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let mut builder = bindgen::Builder::default()
-        .header("old-src/custom/wrapper.h")
-        .clang_arg("-I./old-src/include")
-        .clang_arg("-I./old-src/custom")
+        .header("port/wrapper.h")
+        .clang_arg("-I./src/include")
+        .clang_arg("-I./port")
         .clang_arg("-Wno-everything")
         .layout_tests(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));

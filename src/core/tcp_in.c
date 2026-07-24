@@ -316,6 +316,10 @@ tcp_input(struct pbuf *p, struct netif *inp)
        are LISTENing for incoming connections. */
     prev = NULL;
     for (lpcb = tcp_listen_pcbs.listen_pcbs; lpcb != NULL; lpcb = lpcb->next) {
+#if TUN2SOCKS
+      break;
+#endif /* TUN2SOCKS */
+
       /* check if PCB is bound to specific netif */
       if ((lpcb->netif_idx != NETIF_NO_INDEX) &&
           (lpcb->netif_idx != netif_get_index(ip_data.current_input_netif))) {
@@ -676,6 +680,9 @@ tcp_listen_input(struct tcp_pcb_listen *pcb)
     ip_addr_copy(npcb->local_ip, *ip_current_dest_addr());
     ip_addr_copy(npcb->remote_ip, *ip_current_src_addr());
     npcb->local_port = pcb->local_port;
+#if TUN2SOCKS
+    npcb->local_port = tcphdr->dest;
+#endif /* TUN2SOCKS */
     npcb->remote_port = tcphdr->src;
     npcb->state = SYN_RCVD;
     npcb->rcv_nxt = seqno + 1;

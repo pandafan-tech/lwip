@@ -75,7 +75,11 @@ struct udp_pcb;
  * @param port the remote port from which the packet was received
  */
 typedef void (*udp_recv_fn)(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+#if TUN2SOCKS
+    const ip_addr_t *addr, u16_t port, const ip_addr_t *dest_addr, u16_t dest_port);
+#else
     const ip_addr_t *addr, u16_t port);
+#endif /* TUN2SOCKS */
 
 /** the UDP protocol control block */
 struct udp_pcb {

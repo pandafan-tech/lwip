@@ -151,6 +151,11 @@ ip4_route_src(const ip4_addr_t *src, const ip4_addr_t *dest)
 struct netif *
 ip4_route(const ip4_addr_t *dest)
 {
+#if TUN2SOCKS
+  LWIP_UNUSED_ARG(dest);
+  return netif_list;
+#endif /* TUN2SOCKS */
+
 #if !LWIP_SINGLE_NETIF
   struct netif *netif;
 
@@ -407,6 +412,11 @@ return_noroute:
 static int
 ip4_input_accept(struct netif *netif)
 {
+#if TUN2SOCKS
+  LWIP_UNUSED_ARG(netif);
+  return 1;
+#endif /* TUN2SOCKS */
+
   LWIP_DEBUGF(IP_DEBUG, ("ip_input: iphdr->dest 0x%"X32_F" netif->ip_addr 0x%"X32_F" (0x%"X32_F", 0x%"X32_F", 0x%"X32_F")\n",
                          ip4_addr_get_u32(ip4_current_dest_addr()), ip4_addr_get_u32(netif_ip4_addr(netif)),
                          ip4_addr_get_u32(ip4_current_dest_addr()) & ip4_addr_get_u32(netif_ip4_netmask(netif)),

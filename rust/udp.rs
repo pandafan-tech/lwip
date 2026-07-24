@@ -59,7 +59,7 @@ fn send_udp(
             pbuf_alloc_reference(data.as_ptr() as *mut _, data.len() as _, pbuf_type_PBUF_REF);
         let src_ip = util::to_ip_addr_t(src_addr.ip());
         let dst_ip = util::to_ip_addr_t(dst_addr.ip());
-        let err = udp_sendto(
+        let err = lwip_rs_udp_sendto(
             pcb as *mut udp_pcb,
             pbuf,
             &dst_ip as *const _,

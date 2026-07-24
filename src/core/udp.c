@@ -108,6 +108,10 @@ again:
   }
   /* Check all PCBs. */
   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
+#if TUN2SOCKS
+    break;
+#endif /* TUN2SOCKS */
+
     if (pcb->local_port == udp_port) {
       if (++n > (UDP_LOCAL_PORT_RANGE_END - UDP_LOCAL_PORT_RANGE_START)) {
         return 0;
@@ -400,8 +404,13 @@ udp_input(struct pbuf *p, struct netif *inp)
 #endif /* SO_REUSE && SO_REUSE_RXTOALL */
       /* callback */
       if (pcb->recv != NULL) {
+#if TUN2SOCKS
+        pcb->recv(pcb->recv_arg, pcb, p, ip_current_src_addr(), src,
+                  ip_current_dest_addr(), dest);
+#else
         /* now the recv function is responsible for freeing p */
         pcb->recv(pcb->recv_arg, pcb, p, ip_current_src_addr(), src);
+#endif /* TUN2SOCKS */
       } else {
         /* no recv function registered? then we have to free the pbuf! */
         pbuf_free(p);
