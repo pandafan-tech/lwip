@@ -140,7 +140,15 @@
 // where the default formula in units of the 8960 compile-time MSS would
 // starve the queue before the buffer fills.
 #define LWIP_WND_SCALE 1
-#define TCP_RCV_SCALE 3
+// The effective receive window is min(TCP_WND, 65535 << TCP_RCV_SCALE), so
+// scale 3 silently capped it at 512 KiB while TCP_WND asked for 2.2 MiB.
+// Nobody noticed on low-RTT paths, but a capture on a virtualised Windows
+// guest (where host scheduling inflates the TUN round trip to 3-6 ms) showed
+// the whole "deep-latency" degraded mode was just this: a smooth,
+// stall-free, window-limited flow at 512KiB/RTT — 0.65-0.96 Gbit/s with
+// near-zero CPU, raw window field topping out at 46720 (~373 KiB effective).
+// Scale 6 lets the full configured window through (65535 << 6 = 4 MiB cap).
+#define TCP_RCV_SCALE 6
 #define TCP_WND (256 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_BUF (256 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_QUEUELEN 512
