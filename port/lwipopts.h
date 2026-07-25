@@ -125,10 +125,20 @@
 // Desktop system TCP stacks auto-tune into much larger windows. Keep PandaCore
 // at the kernel's 256 KiB congestion-window scale without increasing either
 // mobile platform's per-flow memory budget.
+//
+// TCP_SND_BUF bounds the reverse (downlink) path: measured on the macOS
+// loopback TUN benchmark, the write->ACK loop turns around in ~50us, so the
+// old 64*MSS (91 KiB) send buffer capped reverse throughput at ~15 Gbit/s
+// with the core mostly idle. 256*MSS matches TCP_WND and lifts the ceiling
+// without touching the mobile tiers. TCP_SND_QUEUELEN must cover the
+// 1460-byte runtime MSS of 1500-MTU TUNs (256 segments per full buffer),
+// where the default formula in units of the 8960 compile-time MSS would
+// starve the queue before the buffer fills.
 #define LWIP_WND_SCALE 1
 #define TCP_RCV_SCALE 3
 #define TCP_WND (256 * PANDA_BASE_TCP_MSS)
-#define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (256 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_QUEUELEN 512
 #endif
 #define TCP_SNDLOWAT (2 * PANDA_BASE_TCP_MSS)
 #define TCP_KEEPIDLE_DEFAULT 30000UL
@@ -140,10 +150,17 @@
 #if TARGET_OS_IPHONE
 #define MEM_SIZE (512 * 1024)
 #else
-#define MEM_SIZE (2 * 1024 * 1024)
+// tcp_write(COPY) payloads live in this heap, so the desktop heap must hold
+// several 256*MSS send buffers of in-flight bulk data at once. The heap is
+// BSS: untouched pages stay clean, idle RSS does not grow.
+#define MEM_SIZE (8 * 1024 * 1024)
 #endif
-#else
+#elif defined __ANDROID__
+// Mobile budget: keep the Android heap at its validated size; the desktop
+// send-buffer bump above does not apply to this tier either.
 #define MEM_SIZE (2 * 1024 * 1024)
+#else
+#define MEM_SIZE (8 * 1024 * 1024)
 #endif
 
 #define MEMP_NUM_TCP_SEG 4096
