@@ -108,10 +108,6 @@ again:
   }
   /* Check all PCBs. */
   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
-#if TUN2SOCKS
-    break;
-#endif /* TUN2SOCKS */
-
     if (pcb->local_port == udp_port) {
       if (++n > (UDP_LOCAL_PORT_RANGE_END - UDP_LOCAL_PORT_RANGE_START)) {
         return 0;
@@ -255,6 +251,13 @@ udp_input(struct pbuf *p, struct netif *inp)
    * preferred. If no perfect match is found, the first unconnected pcb that
    * matches the local port and ip address gets the datagram. */
   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
+#if TUN2SOCKS
+    /* go-tun2socks logic: every datagram is delivered to the first (only)
+     * PCB; the library user owns demultiplexing. The extended recv callback
+     * below passes the original destination along. */
+    break;
+#endif /* TUN2SOCKS */
+
     /* print the PCB local and remote address */
     LWIP_DEBUGF(UDP_DEBUG, ("pcb ("));
     ip_addr_debug_print_val(UDP_DEBUG, pcb->local_ip);
