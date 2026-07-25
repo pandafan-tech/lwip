@@ -113,6 +113,17 @@ impl NetStackImpl {
             OUTPUT_PACKET_MAX_CAPACITY,
         );
 
+        // 250ms matches lwIP's TCP timer granularity, but it is also the only
+        // millisecond-scale wait on the whole data path: delayed ACKs flush on
+        // tcp_fasttmr, which only this loop drives. A flow that falls into a
+        // wait-for-timer rhythm shows up as near-zero CPU with collapsed
+        // throughput (measured: 0.66 Gbit/s at 0.01 cores on a Windows
+        // guest). Overridable to let that hypothesis be tested per platform.
+        let timer_interval = std::env::var("PANDA_LWIP_TIMER_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| (1..=1000).contains(ms))
+            .unwrap_or(250);
         let timeout_task = tokio::spawn(async move {
             loop {
                 {
@@ -122,7 +133,7 @@ impl NetStackImpl {
                 // The guard is released before this await: abort() can only
                 // cancel the task at the await point, so the lock is never
                 // abandoned in the locked state.
-                tokio::time::sleep(time::Duration::from_millis(250)).await;
+                tokio::time::sleep(time::Duration::from_millis(timer_interval)).await;
             }
         });
 
