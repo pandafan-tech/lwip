@@ -15,11 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering::*};
 // spin-then-yield lock has near-zero contention. Do not reintroduce a blocking
 // mutex here without an async-aware redesign of the lwIP core lock.
 
-#[derive(Debug)]
-pub struct AtomicMutex {
-    locked: AtomicBool,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct AtomicMutexErr;
 
@@ -31,59 +26,100 @@ impl std::fmt::Display for AtomicMutexErr {
 
 impl std::error::Error for AtomicMutexErr {}
 
-pub struct AtomicMutexGuard<'a> {
-    mutex: &'a AtomicMutex,
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+mod imp {
+    use super::AtomicMutexErr;
+
+    #[derive(Debug)]
+    pub struct AtomicMutex {
+        inner: parking_lot::Mutex<()>,
+    }
+
+    pub struct AtomicMutexGuard<'a> {
+        _guard: parking_lot::MutexGuard<'a, ()>,
+    }
+
+    impl AtomicMutex {
+        pub const fn new() -> Self {
+            Self {
+                inner: parking_lot::const_mutex(()),
+            }
+        }
+
+        pub fn try_lock(&self) -> Result<AtomicMutexGuard<'_>, AtomicMutexErr> {
+            self.inner
+                .try_lock()
+                .map(|guard| AtomicMutexGuard { _guard: guard })
+                .ok_or(AtomicMutexErr)
+        }
+
+        pub fn lock(&self) -> AtomicMutexGuard<'_> {
+            AtomicMutexGuard {
+                _guard: self.inner.lock(),
+            }
+        }
+    }
 }
 
-impl AtomicMutex {
-    pub const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+mod imp {
+    use super::AtomicMutexErr;
+    use std::sync::atomic::{AtomicBool, Ordering::*};
+
+    #[derive(Debug)]
+    pub struct AtomicMutex {
+        locked: AtomicBool,
     }
 
-    pub fn try_lock(&self) -> Result<AtomicMutexGuard<'_>, AtomicMutexErr> {
-        if self.locked.swap(true, Acquire) {
-            Err(AtomicMutexErr)
-        } else {
-            Ok(AtomicMutexGuard { mutex: self })
-        }
+    pub struct AtomicMutexGuard<'a> {
+        mutex: &'a AtomicMutex,
     }
 
-    pub fn lock(&self) -> AtomicMutexGuard<'_> {
-        // Bounded spin, then yield. The previous pure `loop { try_lock }`
-        // burned the whole OS thread while waiting: on a small tokio
-        // runtime (worker_threads(2) in the iOS packet tunnel), one worker
-        // holding the lock in sys_check_timeouts while another spun here
-        // meant NO other task could be polled — with enough contenders the
-        // runtime live-locked permanently. Yielding lets the OS reschedule
-        // the holder (and lets other runtime threads make progress) at the
-        // cost of a syscall on the slow path. Unlike a parking mutex, this
-        // never blocks the worker thread off the scheduler.
-        let mut spins = 0u32;
-        loop {
-            if let Ok(m) = self.try_lock() {
-                break m;
+    impl AtomicMutex {
+        pub const fn new() -> Self {
+            Self {
+                locked: AtomicBool::new(false),
             }
-            spins += 1;
-            if spins < 64 {
-                std::hint::spin_loop();
+        }
+
+        pub fn try_lock(&self) -> Result<AtomicMutexGuard<'_>, AtomicMutexErr> {
+            if self.locked.swap(true, Acquire) {
+                Err(AtomicMutexErr)
             } else {
-                std::thread::yield_now();
+                Ok(AtomicMutexGuard { mutex: self })
+            }
+        }
+
+        pub fn lock(&self) -> AtomicMutexGuard<'_> {
+            // Bounded spin, then yield; see the module comment for why this
+            // must never park on the small mobile runtimes.
+            let mut spins = 0u32;
+            loop {
+                if let Ok(m) = self.try_lock() {
+                    break m;
+                }
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
             }
         }
     }
+
+    impl<'a> Drop for AtomicMutexGuard<'a> {
+        fn drop(&mut self) {
+            let _prev = self.mutex.locked.swap(false, Release);
+            debug_assert!(_prev);
+        }
+    }
 }
+
+pub use imp::{AtomicMutex, AtomicMutexGuard};
 
 impl Default for AtomicMutex {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl<'a> Drop for AtomicMutexGuard<'a> {
-    fn drop(&mut self) {
-        let _prev = self.mutex.locked.swap(false, Release);
-        debug_assert!(_prev);
     }
 }
