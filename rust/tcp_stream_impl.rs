@@ -113,6 +113,13 @@ pub struct TcpStreamImpl {
     dest_addr: SocketAddr,
     pcb: usize,
     read_buf: Option<(QueuedTcpPacket, usize)>,
+    // Segments already claimed from the shared read_queue but not yet copied
+    // out. Draining into this under the lock and copying from it after
+    // releasing keeps the memcpy out of the global critical section — with
+    // the copy inside it, a relay pulling tens of kilobytes stalls the whole
+    // stack's input path for the duration, which on a preemption-prone host
+    // is what feeds the spin-yield contention storm.
+    staged: std::collections::VecDeque<QueuedTcpPacket>,
     callback_ctx: TcpStreamContext,
     _active: ActiveTcpStream,
 }
@@ -143,6 +150,7 @@ impl TcpStreamImpl {
                 dest_addr,
                 pcb: pcb as usize,
                 read_buf: None,
+            staged: std::collections::VecDeque::new(),
                 callback_ctx: TcpStreamContext::new(src_addr),
                 _active: ActiveTcpStream::new(),
             });
@@ -188,12 +196,34 @@ impl AsyncRead for TcpStreamImpl {
         buf: &mut ReadBuf,
     ) -> Poll<io::Result<()>> {
         let me = &mut *self;
-        let guard = LWIP_MUTEX.lock();
-        let ctx = &mut *me.callback_ctx.with_lock(&guard);
-        if ctx.errored {
-            return Poll::Ready(Err(broken_pipe()));
+
+        // Locked phase one: claim everything queued, register the waker if
+        // there is nothing to deliver. No copying happens under the lock.
+        let read_eof;
+        {
+            let guard = LWIP_MUTEX.lock();
+            let ctx = &mut *me.callback_ctx.with_lock(&guard);
+            if ctx.errored {
+                return Poll::Ready(Err(broken_pipe()));
+            }
+            while let Some(data) = ctx.read_queue.pop_front() {
+                me.staged.push_back(data);
+            }
+            read_eof = ctx.read_eof;
+            if me.read_buf.is_none() && me.staged.is_empty() && !read_eof {
+                let should_replace = ctx
+                    .read_waker
+                    .as_ref()
+                    .map(|waker| !waker.will_wake(cx.waker()))
+                    .unwrap_or(true);
+                if should_replace {
+                    ctx.read_waker = Some(cx.waker().clone());
+                }
+                return Poll::Pending;
+            }
         }
 
+        // Unlocked phase: copy into the caller's buffer.
         let mut consumed = 0usize;
         let result = loop {
             if buf.remaining() == 0 {
@@ -201,20 +231,13 @@ impl AsyncRead for TcpStreamImpl {
             }
 
             if me.read_buf.is_none() {
-                if let Some(data) = ctx.read_queue.pop_front() {
+                if let Some(data) = me.staged.pop_front() {
                     me.read_buf = Some((data, 0));
-                } else if ctx.read_eof || consumed > 0 {
-                    break Poll::Ready(Ok(()));
                 } else {
-                    let should_replace = ctx
-                        .read_waker
-                        .as_ref()
-                        .map(|waker| !waker.will_wake(cx.waker()))
-                        .unwrap_or(true);
-                    if should_replace {
-                        ctx.read_waker = Some(cx.waker().clone());
-                    }
-                    break Poll::Pending;
+                    // Everything staged was delivered; either this poll made
+                    // progress or the peer closed.
+                    debug_assert!(read_eof || consumed > 0);
+                    break Poll::Ready(Ok(()));
                 }
             }
 
@@ -231,13 +254,21 @@ impl AsyncRead for TcpStreamImpl {
             }
         };
 
-        let mut unacknowledged = consumed;
-        while unacknowledged > 0 {
-            let acknowledged = unacknowledged.min(u16::MAX as usize);
-            unsafe {
-                tcp_recved(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
+        // Locked phase two: open the lwIP receive window for what was copied.
+        // The pcb may have died while the lock was released, so re-check.
+        if consumed > 0 {
+            let guard = LWIP_MUTEX.lock();
+            let ctx = &*me.callback_ctx.with_lock(&guard);
+            if !ctx.errored {
+                let mut unacknowledged = consumed;
+                while unacknowledged > 0 {
+                    let acknowledged = unacknowledged.min(u16::MAX as usize);
+                    unsafe {
+                        tcp_recved(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
+                    }
+                    unacknowledged -= acknowledged;
+                }
             }
-            unacknowledged -= acknowledged;
         }
 
         result
