@@ -110,6 +110,11 @@
 // Compile for the largest MSS used by the default desktop TUN MTU (9000).
 // The effective MSS is still capped at runtime by netif->mtu, so mobile and
 // 1500-byte TUNs continue to advertise 1460.
+//
+// A 65095 MSS for 65535-MTU Linux TUNs was measured (2026-07-25) and gained
+// nothing: PandaCore stayed at 24.4 Gbit/s while the kernel-TCP comparison
+// scaled to 40.9. The forward path is serialization-bound at ~0.5 cores,
+// not segment-bound, so a bigger MSS only costs memory.
 #define TCP_MSS 8960
 #if defined __APPLE__ && TARGET_OS_IPHONE
 // Network Extension has a tight process-memory ceiling. Keep the mobile

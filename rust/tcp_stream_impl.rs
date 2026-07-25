@@ -284,7 +284,12 @@ impl AsyncWrite for TcpStreamImpl {
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
         }
-        let to_write = buf.len().min(self.send_buf_size());
+        // tcp_write takes a u16 length; without the clamp a >64 KiB caller
+        // buffer would silently truncate through the `as u16_t` cast below.
+        let to_write = buf
+            .len()
+            .min(self.send_buf_size())
+            .min(usize::from(u16::MAX));
         if to_write == 0 {
             ctx.write_waker.replace(cx.waker().clone());
             return Poll::Pending;
