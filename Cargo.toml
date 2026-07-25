@@ -33,7 +33,3 @@ tokio = { version = "1", features = [
 [build-dependencies]
 bindgen = "0.69"
 cc = "1.0"
-
-# Desktop-only: the core lock parks waiters there (see rust/mutex.rs).
-[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-parking_lot = "0.12"
