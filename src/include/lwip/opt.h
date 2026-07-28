@@ -1289,14 +1289,30 @@
 #endif
 
 /**
- * TCP_WND: The size of a TCP window.  This must be at least
- * (2 * TCP_MSS) for things to work well.
- * ATTENTION: when using TCP_RCV_SCALE, TCP_WND is the total size
- * with scaling applied. Maximum window value in the TCP header
- * will be TCP_WND >> TCP_RCV_SCALE
+ * TCP_WND: The compile-time upper bound of a TCP receive window. This must be
+ * at least (2 * TCP_MSS) for things to work well.
+ * ATTENTION: when using TCP_RCV_SCALE, TCP_WND is the total compile-time
+ * bound with scaling applied. Its maximum window value in the TCP header
+ * is TCP_WND >> TCP_RCV_SCALE.
  */
 #if !defined TCP_WND || defined __DOXYGEN__
 #define TCP_WND                         (4 * TCP_MSS)
+#endif
+
+/**
+ * TCP_WND_RUNTIME_DEFAULT: Initial active receive window. TCP_WND remains the
+ * compile-time upper bound used by lwIP's configuration sanity checks.
+ */
+#if !defined TCP_WND_RUNTIME_DEFAULT || defined __DOXYGEN__
+#define TCP_WND_RUNTIME_DEFAULT         TCP_WND
+#endif
+
+/**
+ * TCP_WND_RUNTIME_MIN: Smallest active receive window accepted at runtime.
+ * The generic default preserves existing integrations; ports may raise it.
+ */
+#if !defined TCP_WND_RUNTIME_MIN || defined __DOXYGEN__
+#define TCP_WND_RUNTIME_MIN             1
 #endif
 
 /**

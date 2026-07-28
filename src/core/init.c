@@ -151,6 +151,9 @@ PACK_STRUCT_END
 #error "If you want to use TCP, TCP_WND must fit in an u16_t, so, you have to reduce it in your lwipopts.h (or enable window scaling)"
 #endif
 #endif /* LWIP_WND_SCALE */
+#if (LWIP_TCP && ((TCP_WND_RUNTIME_MIN == 0) || (TCP_WND_RUNTIME_MIN > TCP_WND_RUNTIME_DEFAULT) || (TCP_WND_RUNTIME_DEFAULT > TCP_WND)))
+#error "TCP_WND_RUNTIME_MIN and TCP_WND_RUNTIME_DEFAULT must satisfy 0 < min <= default <= TCP_WND"
+#endif
 #if (LWIP_TCP && (TCP_SND_QUEUELEN > 0xffff))
 #error "If you want to use TCP, TCP_SND_QUEUELEN must fit in an u16_t, so, you have to reduce it in your lwipopts.h"
 #endif

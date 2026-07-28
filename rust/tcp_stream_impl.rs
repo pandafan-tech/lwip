@@ -334,16 +334,16 @@ impl AsyncWrite for TcpStreamImpl {
             )
         };
         if err == err_enum_t_ERR_OK as err_t {
-            // Call output in case of mem err?
-            let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
-            if err == err_enum_t_ERR_OK as err_t {
-                Poll::Ready(Ok(to_write))
-            } else {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    format!("netstack tcp_output error {}", err),
-                )))
+            let output_err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
+            if output_err != err_enum_t_ERR_OK as err_t {
+                // tcp_write already accepted these bytes into lwIP's unsent
+                // queue. Reporting an error would make AsyncWrite callers
+                // retry the same bytes and duplicate the stream; lwIP keeps
+                // the segment queued and retries it from its normal output
+                // path once the temporary pressure clears.
+                debug!("netstack tcp_output deferred after accepted write: {output_err}");
             }
+            Poll::Ready(Ok(to_write))
         } else if err == err_enum_t_ERR_MEM as err_t {
             // trace!("netstack tcp err_mem on {}", &local_addr);
             ctx.write_waker.replace(cx.waker().clone());

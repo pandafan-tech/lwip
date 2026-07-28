@@ -1,9 +1,21 @@
-use std::{io, os::raw, pin::Pin, sync::Once, time};
+use std::{
+    io,
+    os::raw,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Once,
+    },
+    time,
+};
+
+#[cfg(any(windows, test))]
+use std::{ffi::OsStr, sync::OnceLock};
 
 use futures::sink::Sink;
 use futures::stream::Stream;
 use futures::task::{Context, Poll};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender, WeakSender};
 
 use super::lwip::*;
 use super::output::{output_ip4, output_ip6, OUTPUT_CB_PTR};
@@ -11,10 +23,134 @@ use super::packet::{IpPacket, PacketPool, PacketPoolStats};
 use super::{LWIPMutexGuard, LWIP_MUTEX};
 
 static LWIP_INIT: Once = Once::new();
-const DEFAULT_MTU: u16 = 1500;
+static EGRESS_BACKPRESSURED: AtomicBool = AtomicBool::new(false);
+pub(crate) const DEFAULT_MTU: u16 = 1500;
 const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
 const _: () = assert!(MEM_ALIGNMENT == 1);
+#[cfg(windows)]
+const _: () = assert!(TCP_WND == 2872 * PANDA_BASE_TCP_MSS);
+#[cfg(windows)]
+const _: () = assert!(TCP_WND_RUNTIME_DEFAULT == 512 * PANDA_BASE_TCP_MSS);
+
+#[cfg(windows)]
+const TCP_RCV_WND_MSS_ENV: &str = "PANDA_LWIP_TCP_RCV_WND_MSS";
+#[cfg(windows)]
+static WINDOWS_TCP_RCV_WINDOW: OnceLock<std::result::Result<u32, String>> = OnceLock::new();
+
+#[cfg(any(windows, test))]
+fn parse_windows_tcp_rcv_window_mss(
+    raw: Option<&OsStr>,
+    compiled_max_mss: u32,
+    default_mss: u32,
+) -> Result<u32, String> {
+    let value = match raw {
+        Some(raw) => raw
+            .to_str()
+            .ok_or_else(|| "value must be valid UTF-8".to_owned())?
+            .parse::<u32>()
+            .map_err(|_| "value must be an unsigned decimal integer".to_owned())?,
+        None => default_mss,
+    };
+
+    if !(2..=compiled_max_mss).contains(&value) {
+        return Err(format!(
+            "value must be between 2 and {compiled_max_mss} MSS, got {value}"
+        ));
+    }
+
+    Ok(value)
+}
+
+#[cfg(any(windows, test))]
+fn initialize_windows_tcp_rcv_window_once<Read, Apply>(
+    config: &OnceLock<std::result::Result<u32, String>>,
+    read: Read,
+    compiled_max_mss: u32,
+    default_mss: u32,
+    base_mss: u32,
+    apply: Apply,
+) -> std::result::Result<u32, String>
+where
+    Read: FnOnce() -> Option<std::ffi::OsString>,
+    Apply: FnOnce(u32) -> std::result::Result<(), String>,
+{
+    config
+        .get_or_init(|| {
+            let raw = read();
+            let active_mss =
+                parse_windows_tcp_rcv_window_mss(raw.as_deref(), compiled_max_mss, default_mss)?;
+            let active_window = active_mss
+                .checked_mul(base_mss)
+                .ok_or_else(|| "active TCP receive window overflowed u32".to_owned())?;
+            apply(active_window)?;
+            Ok(active_window)
+        })
+        .clone()
+}
+
+/// Validate and apply the Windows lwIP runtime environment exactly once.
+///
+/// Both success and failure are cached for the process lifetime. Other
+/// platforms return success without reading the Windows-only environment.
+#[cfg(windows)]
+pub fn initialize_windows_runtime_config() -> super::Result<()> {
+    let compiled_max_mss = TCP_WND / PANDA_BASE_TCP_MSS;
+    let default_mss = TCP_WND_RUNTIME_DEFAULT / PANDA_BASE_TCP_MSS;
+    initialize_windows_tcp_rcv_window_once(
+        &WINDOWS_TCP_RCV_WINDOW,
+        || std::env::var_os(TCP_RCV_WND_MSS_ENV),
+        compiled_max_mss,
+        default_mss,
+        PANDA_BASE_TCP_MSS,
+        |active_window| {
+            let result = unsafe { tcp_set_wnd_runtime(active_window) };
+            if result != err_enum_t_ERR_OK as err_t {
+                return Err(format!(
+                    "{TCP_RCV_WND_MSS_ENV} produced {active_window} bytes outside the C runtime bounds"
+                ));
+            }
+            log::info!(
+                "lwIP TCP receive window: compiled_max={} bytes ({} MSS), active={} bytes ({} MSS)",
+                TCP_WND,
+                compiled_max_mss,
+                active_window,
+                active_window / PANDA_BASE_TCP_MSS
+            );
+            Ok(())
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        super::Error::RuntimeConfig(format!("{TCP_RCV_WND_MSS_ENV}: {error}"))
+    })
+}
+
+#[cfg(not(windows))]
+pub fn initialize_windows_runtime_config() -> super::Result<()> {
+    Ok(())
+}
+
+fn initialize_lwip() {
+    initialize_windows_runtime_config().unwrap_or_else(|error| panic!("{error}"));
+    LWIP_INIT.call_once(|| unsafe { lwip_init() });
+}
+
+pub(crate) fn mark_egress_backpressured() {
+    EGRESS_BACKPRESSURED.store(true, Ordering::Release);
+}
+
+pub(crate) fn retry_backpressured_tcp_output() {
+    if !EGRESS_BACKPRESSURED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+
+    let _guard = LWIP_MUTEX.lock();
+    let err = unsafe { lwip_rs_retry_tcp_output() };
+    if err != err_enum_t_ERR_OK as err_t && !EGRESS_BACKPRESSURED.load(Ordering::Acquire) {
+        log::warn!("lwIP deferred TCP output retry failed: {err}");
+    }
+}
 
 #[repr(C)]
 struct OwnedInputPbuf {
@@ -103,7 +239,7 @@ impl NetStackImpl {
     }
 
     pub(crate) fn new_with_mtu(buffer_size: usize, mtu: u16) -> Box<Self> {
-        LWIP_INIT.call_once(|| unsafe { lwip_init() });
+        initialize_lwip();
 
         unsafe { lwip_rs_configure_netif(Some(output_ip4), Some(output_ip6), mtu) };
 
@@ -156,12 +292,14 @@ impl NetStackImpl {
         self.output_pool.acquire(length)
     }
 
-    pub(crate) fn output(&mut self, pkt: IpPacket) {
+    pub(crate) fn egress_sender(&self) -> WeakSender<IpPacket> {
+        self.tx.downgrade()
+    }
+
+    pub(crate) fn output(&mut self, pkt: IpPacket) -> Result<(), TrySendError<IpPacket>> {
         // tokio's mpsc wakes the receiver on try_send; no manual waker is
         // needed, so egress consumers never have to touch LWIP_MUTEX.
-        if self.tx.try_send(pkt).is_err() {
-            // log::trace!("try send stack output pkt failed: {}", e);
-        }
+        self.tx.try_send(pkt)
     }
 
     /// Take the egress receiver so packets leaving lwIP can be drained from a
@@ -229,11 +367,15 @@ impl Stream for NetStackImpl {
             .rx
             .as_mut()
             .expect("netstack egress receiver already taken");
-        match rx.poll_recv(cx) {
+        let result = match rx.poll_recv(cx) {
             Poll::Ready(Some(pkt)) => Poll::Ready(Some(Ok(pkt))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
+        };
+        if matches!(&result, Poll::Ready(Some(_))) {
+            retry_backpressured_tcp_output();
         }
+        result
     }
 }
 
@@ -280,6 +422,8 @@ impl Sink<Vec<u8>> for NetStackImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct NetifListRestore(*mut netif);
 
@@ -287,6 +431,18 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 netif_list = self.0;
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    struct TcpWndRuntimeRestore(tcpwnd_size_t);
+
+    #[cfg(not(windows))]
+    impl Drop for TcpWndRuntimeRestore {
+        fn drop(&mut self) {
+            unsafe {
+                assert_eq!(tcp_set_wnd_runtime(self.0), err_enum_t_ERR_OK as err_t);
             }
         }
     }
@@ -312,5 +468,190 @@ mod tests {
                 }
                 drop(stack);
             });
+    }
+
+    #[test]
+    fn windows_tcp_receive_window_parser_accepts_only_the_supported_range() {
+        assert_eq!(
+            parse_windows_tcp_rcv_window_mss(None, 2872, 512).unwrap(),
+            512
+        );
+        assert_eq!(
+            parse_windows_tcp_rcv_window_mss(Some("2".as_ref()), 2872, 512).unwrap(),
+            2
+        );
+        assert_eq!(
+            parse_windows_tcp_rcv_window_mss(Some("2872".as_ref()), 2872, 512).unwrap(),
+            2872
+        );
+
+        for invalid in ["", "one", "1", "2873", "2.0", " 512"] {
+            assert!(
+                parse_windows_tcp_rcv_window_mss(Some(invalid.as_ref()), 2872, 512).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_tcp_receive_window_parser_rejects_non_utf8() {
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+
+        assert!(parse_windows_tcp_rcv_window_mss(Some(&invalid), 2872, 512).is_err());
+    }
+
+    #[test]
+    fn windows_runtime_config_reads_and_applies_once_under_concurrency() {
+        let config = std::sync::OnceLock::new();
+        let reads = AtomicUsize::new(0);
+        let applies = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                tasks.push(scope.spawn(|| {
+                    initialize_windows_tcp_rcv_window_once(
+                        &config,
+                        || {
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            Some(OsString::from("512"))
+                        },
+                        2872,
+                        512,
+                        PANDA_BASE_TCP_MSS,
+                        |_| {
+                            applies.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                }));
+            }
+            for task in tasks {
+                assert_eq!(task.join().unwrap().unwrap(), 512 * PANDA_BASE_TCP_MSS);
+            }
+        });
+
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(applies.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn windows_runtime_config_caches_failure_without_rereading() {
+        let config = std::sync::OnceLock::new();
+        let reads = AtomicUsize::new(0);
+        let applies = AtomicUsize::new(0);
+
+        let first = initialize_windows_tcp_rcv_window_once(
+            &config,
+            || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Some(OsString::from("1"))
+            },
+            2872,
+            512,
+            PANDA_BASE_TCP_MSS,
+            |_| {
+                applies.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        let second = initialize_windows_tcp_rcv_window_once(
+            &config,
+            || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Some(OsString::from("512"))
+            },
+            2872,
+            512,
+            PANDA_BASE_TCP_MSS,
+            |_| {
+                applies.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(first, second);
+        assert!(first.is_err());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(applies.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tcp_runtime_receive_window_rejects_values_below_two_base_mss() {
+        let _guard = LWIP_MUTEX.lock();
+        initialize_lwip();
+
+        unsafe {
+            let _restore = TcpWndRuntimeRestore(TCP_WND);
+            assert_eq!(
+                tcp_set_wnd_runtime((2 * PANDA_BASE_TCP_MSS) - 1),
+                err_enum_t_ERR_VAL as err_t
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tcp_recved_stays_capped_at_the_runtime_receive_window() {
+        let _guard = LWIP_MUTEX.lock();
+        initialize_lwip();
+
+        unsafe {
+            let original_window = TCP_WND;
+            assert_eq!(original_window, TCP_WND);
+
+            assert_eq!(tcp_set_wnd_runtime(0), err_enum_t_ERR_VAL as err_t);
+            assert_eq!(
+                tcp_set_wnd_runtime(TCP_WND + 1),
+                err_enum_t_ERR_VAL as err_t
+            );
+            let unchanged_pcb = tcp_new();
+            assert!(!unchanged_pcb.is_null());
+            assert_eq!((*unchanged_pcb).rcv_wnd_max, original_window);
+            tcp_abort(unchanged_pcb);
+
+            let initial_window = 2 * PANDA_BASE_TCP_MSS;
+            assert_eq!(
+                tcp_set_wnd_runtime(initial_window),
+                err_enum_t_ERR_OK as err_t
+            );
+            let _restore = TcpWndRuntimeRestore(original_window);
+
+            let initial_pcb = tcp_new();
+            assert!(!initial_pcb.is_null());
+            assert_eq!((*initial_pcb).rcv_wnd_max, initial_window);
+            assert_eq!((*initial_pcb).rcv_wnd, initial_window);
+            tcp_abort(initial_pcb);
+
+            let active_window = 128 * PANDA_BASE_TCP_MSS;
+            assert_eq!(
+                tcp_set_wnd_runtime(active_window),
+                err_enum_t_ERR_OK as err_t
+            );
+            let pcb = tcp_new();
+            assert!(!pcb.is_null());
+            assert_eq!((*pcb).rcv_wnd_max, active_window);
+            assert_eq!((*pcb).rcv_wnd, u16::MAX as tcpwnd_size_t);
+
+            assert_eq!(tcp_set_wnd_runtime(TCP_WND), err_enum_t_ERR_OK as err_t);
+            assert_eq!((*pcb).rcv_wnd_max, active_window);
+            (*pcb).flags |= TF_WND_SCALE as tcpflags_t;
+            (*pcb).rcv_wnd = active_window - 1;
+            tcp_recved(pcb, u16::MAX);
+            assert_eq!((*pcb).rcv_wnd, active_window);
+            assert_ne!((*pcb).rcv_wnd, TCP_WND);
+
+            tcp_abort(pcb);
+        }
     }
 }

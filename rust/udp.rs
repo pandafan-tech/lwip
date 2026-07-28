@@ -1,15 +1,80 @@
-use std::{io, net::SocketAddr, os::raw, pin::Pin};
+use std::{
+    io,
+    net::SocketAddr,
+    os::raw,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use futures::stream::Stream;
 use futures::task::{Context, Poll, Waker};
 use futures::StreamExt;
 use log::{error, warn};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{channel, error::TryRecvError, error::TrySendError, Receiver, Sender, WeakSender},
+    Mutex as AsyncMutex,
+};
 
 use super::lwip::*;
 use super::packet::{IpPacket, PacketPool};
 use super::util;
 use crate::Error;
+
+const UDP_HEADER_LEN: usize = 8;
+const IPV4_HEADER_LEN: usize = 20;
+const IPV6_HEADER_LEN: usize = 40;
+const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
+const IPV6_MINIMUM_MTU: usize = 1280;
+static UDP_INGRESS_QUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UdpRuntimeStats {
+    pub ingress_queue_drops: u64,
+}
+
+pub fn udp_runtime_stats() -> UdpRuntimeStats {
+    UdpRuntimeStats {
+        ingress_queue_drops: UDP_INGRESS_QUEUE_DROPS.load(Ordering::Relaxed),
+    }
+}
+
+fn udp_egress_slots(data_len: usize, destination: &SocketAddr, mtu: u16) -> io::Result<usize> {
+    let transport_len = data_len
+        .checked_add(UDP_HEADER_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "UDP datagram is too large"))?;
+    let mtu = usize::from(mtu);
+    let (ip_header_len, fragment_header_len, fragment_mtu) = if destination.is_ipv6() {
+        (
+            IPV6_HEADER_LEN,
+            IPV6_FRAGMENT_HEADER_LEN,
+            mtu.min(IPV6_MINIMUM_MTU),
+        )
+    } else {
+        (IPV4_HEADER_LEN, 0, mtu)
+    };
+    let total_len = transport_len
+        .checked_add(ip_header_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "UDP datagram is too large"))?;
+    if total_len <= mtu {
+        return Ok(1);
+    }
+
+    let headers_len = ip_header_len + fragment_header_len;
+    let fragment_payload = fragment_mtu
+        .checked_sub(headers_len)
+        .map(|length| length & !7)
+        .filter(|length| *length > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("MTU {mtu} is too small for UDP fragmentation"),
+            )
+        })?;
+    transport_len
+        .checked_add(fragment_payload - 1)
+        .map(|length| length / fragment_payload)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "UDP datagram is too large"))
+}
 
 pub unsafe extern "C" fn udp_recv_cb(
     arg: *mut raw::c_void,
@@ -39,8 +104,17 @@ pub unsafe extern "C" fn udp_recv_cb(
         return;
     }
     packet.set_len(tot_len as usize);
-    if socket.tx.try_send((packet, src_addr, dst_addr)).is_err() {
-        // log::trace!("try send udp pkt failed (netstack): {}", e);
+    match socket.tx.try_send((packet, src_addr, dst_addr)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            let drops = UDP_INGRESS_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+            if drops.is_power_of_two() {
+                error!("lwIP UDP ingress queue full; dropped datagrams={drops}");
+            }
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!("lwIP UDP ingress queue closed; dropping datagram");
+        }
     }
     if let Some(waker) = socket.waker.as_ref() {
         waker.wake_by_ref();
@@ -52,9 +126,29 @@ fn send_udp(
     dst_addr: &SocketAddr,
     pcb: usize,
     data: &[u8],
+    egress_tx: &Sender<IpPacket>,
+    required_slots: usize,
 ) -> io::Result<()> {
     unsafe {
         let _g = super::LWIP_MUTEX.lock();
+        if required_slots > egress_tx.max_capacity() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "UDP datagram requires {required_slots} egress slots but the queue capacity is {}",
+                    egress_tx.max_capacity()
+                ),
+            ));
+        }
+        if egress_tx.capacity() < required_slots {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "UDP datagram requires {required_slots} egress slots but only {} are available",
+                    egress_tx.capacity()
+                ),
+            ));
+        }
         let pbuf =
             pbuf_alloc_reference(data.as_ptr() as *mut _, data.len() as _, pbuf_type_PBUF_REF);
         let src_ip = util::to_ip_addr_t(src_addr.ip());
@@ -69,10 +163,11 @@ fn send_udp(
         );
         pbuf_free(pbuf);
         if err != err_enum_t_ERR_OK as err_t {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("udp_sendto error: {}", err),
-            ));
+            let kind = match err {
+                value if value == err_enum_t_ERR_ABRT as err_t => io::ErrorKind::BrokenPipe,
+                _ => io::ErrorKind::Other,
+            };
+            return Err(io::Error::new(kind, format!("udp_sendto error: {}", err)));
         }
         Ok(())
     }
@@ -85,11 +180,17 @@ pub struct UdpSocket {
     waker: Option<Waker>,
     tx: Sender<UdpPkt>,
     rx: Receiver<UdpPkt>,
+    egress_tx: WeakSender<IpPacket>,
+    mtu: u16,
     packet_pool: std::sync::Arc<PacketPool>,
 }
 
 impl UdpSocket {
-    pub(crate) fn new(buffer_size: usize) -> Result<Box<Self>, Error> {
+    pub(crate) fn new(
+        buffer_size: usize,
+        egress_tx: WeakSender<IpPacket>,
+        mtu: u16,
+    ) -> Result<Box<Self>, Error> {
         unsafe {
             let pcb = udp_new();
             let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
@@ -99,6 +200,8 @@ impl UdpSocket {
                 waker: None,
                 tx,
                 rx,
+                egress_tx,
+                mtu,
                 packet_pool,
             });
             let err = udp_bind(pcb, &ip_addr_any_type, 0);
@@ -113,7 +216,15 @@ impl UdpSocket {
     }
 
     pub fn split(self: Box<Self>) -> (SendHalf, RecvHalf) {
-        (SendHalf { pcb: self.pcb }, RecvHalf { socket: self })
+        (
+            SendHalf {
+                pcb: self.pcb,
+                egress_tx: self.egress_tx.clone(),
+                mtu: self.mtu,
+                send_gate: AsyncMutex::new(()),
+            },
+            RecvHalf { socket: self },
+        )
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -154,6 +265,9 @@ impl Stream for UdpSocket {
 
 pub struct SendHalf {
     pub(crate) pcb: usize,
+    egress_tx: WeakSender<IpPacket>,
+    mtu: u16,
+    send_gate: AsyncMutex<()>,
 }
 
 impl SendHalf {
@@ -163,7 +277,47 @@ impl SendHalf {
         src_addr: &SocketAddr,
         dst_addr: &SocketAddr,
     ) -> io::Result<()> {
-        send_udp(src_addr, dst_addr, self.pcb, data)
+        let required_slots = udp_egress_slots(data.len(), dst_addr, self.mtu)?;
+        let sender = self.egress_tx.upgrade().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "lwIP egress queue is closed")
+        })?;
+        send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots)
+    }
+
+    /// Send a datagram without dropping it when the bounded stack-egress
+    /// queue is temporarily full. Capacity is awaited outside LWIP_MUTEX;
+    /// the synchronous callback still returns immediately with ERR_MEM.
+    pub async fn send_to_wait(
+        &self,
+        data: &[u8],
+        src_addr: &SocketAddr,
+        dst_addr: &SocketAddr,
+    ) -> io::Result<()> {
+        let _send_guard = self.send_gate.lock().await;
+        let required_slots = udp_egress_slots(data.len(), dst_addr, self.mtu)?;
+        loop {
+            let sender = self.egress_tx.upgrade().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "lwIP egress queue is closed")
+            })?;
+            if required_slots > sender.max_capacity() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "UDP datagram requires {required_slots} egress slots but the queue capacity is {}",
+                        sender.max_capacity()
+                    ),
+                ));
+            }
+            let permits = sender.reserve_many(required_slots).await.map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "lwIP egress queue is closed")
+            })?;
+            drop(permits);
+
+            match send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => return result,
+            }
+        }
     }
 }
 
@@ -180,6 +334,37 @@ impl RecvHalf {
                 "recv_from udp socket faied: tx closed",
             )),
         }
+    }
+
+    pub fn try_recv_from(&mut self) -> io::Result<Option<UdpPkt>> {
+        let _guard = super::LWIP_MUTEX.lock();
+        match self.socket.rx.try_recv() {
+            Ok(packet) => Ok(Some(packet)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "lwIP UDP ingress queue is closed",
+            )),
+        }
+    }
+
+    pub fn try_recv_many(&mut self, buffer: &mut Vec<UdpPkt>, limit: usize) -> io::Result<usize> {
+        let _guard = super::LWIP_MUTEX.lock();
+        let initial_len = buffer.len();
+        while buffer.len() - initial_len < limit {
+            match self.socket.rx.try_recv() {
+                Ok(packet) => buffer.push(packet),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) if buffer.len() == initial_len => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "lwIP UDP ingress queue is closed",
+                    ));
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(buffer.len() - initial_len)
     }
 }
 

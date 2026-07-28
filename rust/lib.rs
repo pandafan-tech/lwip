@@ -21,10 +21,14 @@ pub use packet::{
     packet_pool_runtime_stats, trim_packet_pools, IpPacket, PacketPool, PacketPoolsRuntimeStats,
 };
 pub use stack::{NetStack, StackEgress, StackIngress};
+pub use stack_impl::initialize_windows_runtime_config;
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;
 pub use tcp_stream_context::{tcp_runtime_stats, TcpRuntimeStats};
-pub use {udp::RecvHalf as UdpRecvHalf, udp::SendHalf as UdpSendHalf, udp::UdpPkt, udp::UdpSocket};
+pub use {
+    udp::udp_runtime_stats, udp::RecvHalf as UdpRecvHalf, udp::SendHalf as UdpSendHalf,
+    udp::UdpPkt, udp::UdpRuntimeStats, udp::UdpSocket,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -33,6 +37,9 @@ pub enum Error {
 
     #[error("AtomicMutexErr {0:?}")]
     AtomicMutexErr(#[from] mutex::AtomicMutexErr),
+
+    #[error("runtime configuration error: {0}")]
+    RuntimeConfig(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -12,7 +12,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::task::Poll;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 struct CountingAlloc;
@@ -211,6 +211,58 @@ async fn establish_tcp_stream(
         .expect("lwIP TCP listener ended unexpectedly");
 
     (stream, client_sequence + 1, server_sequence + 1)
+}
+
+#[test]
+fn accepted_tcp_write_is_not_reported_as_failed_when_egress_is_full() {
+    let _test_guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (stack, mut listener, udp) = NetStack::with_buffer_size(1, 8).unwrap();
+            drop(udp);
+            let (mut ingress, mut egress) = stack.split();
+            let source_port = 20_001;
+            let (mut stream, _, _) =
+                establish_tcp_stream(&mut ingress, &mut egress, &mut listener, source_port).await;
+
+            ingress.input_batch([ipv4_icmp_echo_request(b"fills-egress")]);
+            let payload = b"accepted-before-output-pressure";
+            let written = stream
+                .write(payload)
+                .await
+                .expect("tcp_write accepted bytes must not be reported as failed");
+            assert_eq!(written, payload.len());
+
+            let prefill = timeout(Duration::from_secs(1), egress.recv())
+                .await
+                .expect("the egress prefill packet was not emitted")
+                .expect("lwIP egress closed before the prefill packet");
+            assert_eq!(prefill[9], 1);
+            let emitted_payload = timeout(Duration::from_secs(1), async {
+                loop {
+                    let packet = egress
+                        .recv()
+                        .await
+                        .expect("lwIP egress closed before retrying the queued TCP segment");
+                    if packet[9] != 6 {
+                        continue;
+                    }
+                    let tcp_header_len = usize::from(packet[32] >> 4) * 4;
+                    let payload_offset = 20 + tcp_header_len;
+                    if packet.len() > payload_offset {
+                        return packet[payload_offset..].to_vec();
+                    }
+                }
+            })
+            .await
+            .expect("lwIP did not retry the queued TCP segment after egress drained");
+            assert_eq!(emitted_payload, payload);
+        });
 }
 
 async fn one_unread_window(

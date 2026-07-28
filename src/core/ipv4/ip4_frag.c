@@ -869,7 +869,14 @@ ip4_frag(struct pbuf *p, struct netif *netif, const ip4_addr_t *dest)
     /* No need for separate header pbuf - we allowed room for it in rambuf
      * when allocated.
      */
-    netif->output(netif, rambuf, dest);
+    {
+      err_t output_err = netif->output(netif, rambuf, dest);
+      if (output_err != ERR_OK) {
+        pbuf_free(rambuf);
+        MIB2_STATS_INC(mib2.ipfragfails);
+        return output_err;
+      }
+    }
     IPFRAG_STATS_INC(ip_frag.xmit);
 
     /* Unfortunately we can't reuse rambuf - the hardware may still be

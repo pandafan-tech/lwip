@@ -137,12 +137,12 @@ typedef err_t (*tcp_connected_fn)(void *arg, struct tcp_pcb *tpcb, err_t err);
 #define RCV_WND_SCALE(pcb, wnd) (((wnd) >> (pcb)->rcv_scale))
 #define SND_WND_SCALE(pcb, wnd) (((wnd) << (pcb)->snd_scale))
 #define TCPWND16(x)             ((u16_t)LWIP_MIN((x), 0xFFFF))
-#define TCP_WND_MAX(pcb)        ((tcpwnd_size_t)(((pcb)->flags & TF_WND_SCALE) ? TCP_WND : TCPWND16(TCP_WND)))
+#define TCP_WND_MAX(pcb)        ((tcpwnd_size_t)(((pcb)->flags & TF_WND_SCALE) ? (pcb)->rcv_wnd_max : TCPWND16((pcb)->rcv_wnd_max)))
 #else
 #define RCV_WND_SCALE(pcb, wnd) (wnd)
 #define SND_WND_SCALE(pcb, wnd) (wnd)
 #define TCPWND16(x)             (x)
-#define TCP_WND_MAX(pcb)        TCP_WND
+#define TCP_WND_MAX(pcb)        ((pcb)->rcv_wnd_max)
 #endif
 /* Increments a tcpwnd_size_t and holds at max value rather than rollover */
 #define TCP_WND_INC(wnd, inc)   do { \
@@ -281,6 +281,7 @@ struct tcp_pcb {
 
   /* receiver variables */
   u32_t rcv_nxt;   /* next seqno expected */
+  tcpwnd_size_t rcv_wnd_max; /* fixed receive window limit for this PCB */
   tcpwnd_size_t rcv_wnd;   /* receiver window available */
   tcpwnd_size_t rcv_ann_wnd; /* receiver window to announce */
   u32_t rcv_ann_right_edge; /* announced right edge of window */
@@ -410,6 +411,8 @@ err_t lwip_tcp_event(void *arg, struct tcp_pcb *pcb,
 /* Application program's interface: */
 struct tcp_pcb * tcp_new     (void);
 struct tcp_pcb * tcp_new_ip_type (u8_t type);
+/** Set the receive window used by subsequently allocated PCBs. */
+err_t            tcp_set_wnd_runtime(tcpwnd_size_t wnd);
 
 void             tcp_arg     (struct tcp_pcb *pcb, void *arg);
 #if LWIP_CALLBACK_API

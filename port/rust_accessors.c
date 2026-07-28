@@ -1,5 +1,6 @@
 #include "rust_accessors.h"
 #include "lwip/ip.h"
+#include "lwip/priv/tcp_priv.h"
 
 void lwip_rs_configure_netif(netif_output_fn output,
                              netif_output_ip6_fn output_ip6,
@@ -40,6 +41,18 @@ void lwip_rs_tcp_apply_options(struct tcp_pcb *pcb, int keepalive) {
 tcpwnd_size_t lwip_rs_tcp_send_buffer(const struct tcp_pcb *pcb) {
   LWIP_ASSERT("tcp pcb must not be NULL", pcb != NULL);
   return pcb->snd_buf;
+}
+
+err_t lwip_rs_retry_tcp_output(void) {
+  struct tcp_pcb *pcb;
+
+  for (pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+    err_t err = tcp_output(pcb);
+    if (err != ERR_OK) {
+      return err;
+    }
+  }
+  return ERR_OK;
 }
 
 void lwip_rs_udp_local_endpoint(const struct udp_pcb *pcb,

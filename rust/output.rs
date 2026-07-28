@@ -1,5 +1,6 @@
 use super::lwip::*;
-use super::stack_impl::NetStackImpl;
+use super::stack_impl::{mark_egress_backpressured, NetStackImpl};
+use tokio::sync::mpsc::error::TrySendError;
 
 pub static mut OUTPUT_CB_PTR: usize = 0x0;
 
@@ -19,8 +20,14 @@ fn output(_netif: *mut netif, p: *mut pbuf) -> err_t {
             return err_enum_t_ERR_BUF as err_t;
         }
         packet.set_len(pbuflen as usize);
-        stack.output(packet);
-        err_enum_t_ERR_OK as err_t
+        match stack.output(packet) {
+            Ok(()) => err_enum_t_ERR_OK as err_t,
+            Err(TrySendError::Full(_)) => {
+                mark_egress_backpressured();
+                err_enum_t_ERR_MEM as err_t
+            }
+            Err(TrySendError::Closed(_)) => err_enum_t_ERR_ABRT as err_t,
+        }
     }
 }
 

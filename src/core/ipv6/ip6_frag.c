@@ -856,8 +856,15 @@ ip6_frag(struct pbuf *p, struct netif *netif, const ip6_addr_t *dest)
     /* No need for separate header pbuf - we allowed room for it in rambuf
      * when allocated.
      */
+    {
+      err_t output_err = netif->output_ip6(netif, rambuf, dest);
+      if (output_err != ERR_OK) {
+        pbuf_free(rambuf);
+        IP6_FRAG_STATS_INC(ip6_frag.drop);
+        return output_err;
+      }
+    }
     IP6_FRAG_STATS_INC(ip6_frag.xmit);
-    netif->output_ip6(netif, rambuf, dest);
 
     /* Unfortunately we can't reuse rambuf - the hardware may still be
      * using the buffer. Instead we free it (and the ensuing chain) and

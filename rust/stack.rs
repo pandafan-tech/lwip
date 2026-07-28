@@ -5,7 +5,7 @@ use futures::stream::Stream;
 use futures::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
 
-use super::stack_impl::NetStackImpl;
+use super::stack_impl::{retry_backpressured_tcp_output, NetStackImpl, DEFAULT_MTU};
 use super::tcp_listener::TcpListener;
 use super::udp::UdpSocket;
 use crate::{Error, IpPacket};
@@ -14,22 +14,18 @@ pub struct NetStack(Box<NetStackImpl>);
 
 impl NetStack {
     pub fn new() -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        Ok((
-            NetStack(NetStackImpl::new(512)),
-            TcpListener::new()?,
-            UdpSocket::new(64)?,
-        ))
+        let stack = NetStackImpl::new(512);
+        let udp = UdpSocket::new(64, stack.egress_sender(), DEFAULT_MTU)?;
+        Ok((NetStack(stack), TcpListener::new()?, udp))
     }
 
     pub fn with_buffer_size(
         stack_buffer_size: usize,
         udp_buffer_size: usize,
     ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        Ok((
-            NetStack(NetStackImpl::new(stack_buffer_size)),
-            TcpListener::new()?,
-            UdpSocket::new(udp_buffer_size)?,
-        ))
+        let stack = NetStackImpl::new(stack_buffer_size);
+        let udp = UdpSocket::new(udp_buffer_size, stack.egress_sender(), DEFAULT_MTU)?;
+        Ok((NetStack(stack), TcpListener::new()?, udp))
     }
 
     pub fn with_buffer_size_and_mtu(
@@ -37,11 +33,9 @@ impl NetStack {
         udp_buffer_size: usize,
         mtu: u16,
     ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        Ok((
-            NetStack(NetStackImpl::new_with_mtu(stack_buffer_size, mtu)),
-            TcpListener::new()?,
-            UdpSocket::new(udp_buffer_size)?,
-        ))
+        let stack = NetStackImpl::new_with_mtu(stack_buffer_size, mtu);
+        let udp = UdpSocket::new(udp_buffer_size, stack.egress_sender(), mtu)?;
+        Ok((NetStack(stack), TcpListener::new()?, udp))
     }
 
     /// Split into an ingress half (batch input into lwIP) and an egress half
@@ -75,13 +69,21 @@ pub struct StackEgress(Receiver<IpPacket>);
 
 impl StackEgress {
     pub async fn recv(&mut self) -> Option<IpPacket> {
-        self.0.recv().await
+        let packet = self.0.recv().await;
+        if packet.is_some() {
+            retry_backpressured_tcp_output();
+        }
+        packet
     }
 
     /// Receive up to `limit` packets in one call, awaiting until at least one
     /// is available. Returns the number received (0 = channel closed).
     pub async fn recv_many(&mut self, buffer: &mut Vec<IpPacket>, limit: usize) -> usize {
-        self.0.recv_many(buffer, limit).await
+        let count = self.0.recv_many(buffer, limit).await;
+        if count > 0 {
+            retry_backpressured_tcp_output();
+        }
+        count
     }
 }
 

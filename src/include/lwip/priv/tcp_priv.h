@@ -323,6 +323,7 @@ struct tcp_seg {
 extern struct tcp_pcb *tcp_input_pcb;
 extern u32_t tcp_ticks;
 extern u8_t tcp_active_pcbs_changed;
+tcpwnd_size_t tcp_wnd_runtime_get(void);
 
 /* The TCP PCB lists. */
 union tcp_listen_pcbs_t { /* List of all TCP PCBs in LISTEN state. */

@@ -158,6 +158,9 @@ static const char *const tcp_state_str[] = {
 /* last local TCP port */
 static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
 
+/* Active receive window. It must be configured before allocating TCP PCBs. */
+static tcpwnd_size_t tcp_wnd_runtime = TCP_WND_RUNTIME_DEFAULT;
+
 /* Incremented every coarse grained timer shot (typically every 500 ms). */
 u32_t tcp_ticks;
 static const u8_t tcp_backoff[13] =
@@ -203,6 +206,22 @@ tcp_init(void)
 #ifdef LWIP_RAND
   tcp_port = TCP_ENSURE_LOCAL_PORT_RANGE(LWIP_RAND());
 #endif /* LWIP_RAND */
+}
+
+err_t
+tcp_set_wnd_runtime(tcpwnd_size_t wnd)
+{
+  if ((wnd < TCP_WND_RUNTIME_MIN) || (wnd > TCP_WND)) {
+    return ERR_VAL;
+  }
+  tcp_wnd_runtime = wnd;
+  return ERR_OK;
+}
+
+tcpwnd_size_t
+tcp_wnd_runtime_get(void)
+{
+  return tcp_wnd_runtime;
 }
 
 /** Free a tcp pcb */
@@ -938,7 +957,7 @@ tcp_update_rcv_ann_wnd(struct tcp_pcb *pcb)
   LWIP_ASSERT("tcp_update_rcv_ann_wnd: invalid pcb", pcb != NULL);
   new_right_edge = pcb->rcv_nxt + pcb->rcv_wnd;
 
-  if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge + LWIP_MIN((TCP_WND / 2), pcb->mss))) {
+  if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge + LWIP_MIN((TCP_WND_MAX(pcb) / 2), pcb->mss))) {
     /* we can advertise more window */
     pcb->rcv_ann_wnd = pcb->rcv_wnd;
     return new_right_edge - pcb->rcv_ann_right_edge;
@@ -994,10 +1013,11 @@ tcp_recved(struct tcp_pcb *pcb, u16_t len)
   wnd_inflation = tcp_update_rcv_ann_wnd(pcb);
 
   /* If the change in the right edge of window is significant (default
-   * watermark is TCP_WND/4), then send an explicit update now.
+   * watermark is the smaller of the active window/4 and configured threshold),
+   * then send an explicit update now.
    * Otherwise wait for a packet to be sent in the normal course of
    * events (or more window to be available later) */
-  if (wnd_inflation >= TCP_WND_UPDATE_THRESHOLD) {
+  if (wnd_inflation >= LWIP_MIN((TCP_WND_MAX(pcb) / 4), TCP_WND_UPDATE_THRESHOLD)) {
     tcp_ack_now(pcb);
     tcp_output(pcb);
   }
@@ -1153,7 +1173,7 @@ tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t port,
   pcb->snd_lbb = iss - 1;
   /* Start with a window that does not need scaling. When window scaling is
      enabled and used, the window is enlarged when both sides agree on scaling. */
-  pcb->rcv_wnd = pcb->rcv_ann_wnd = TCPWND_MIN16(TCP_WND);
+  pcb->rcv_wnd = pcb->rcv_ann_wnd = TCPWND_MIN16(pcb->rcv_wnd_max);
   pcb->rcv_ann_right_edge = pcb->rcv_nxt;
   pcb->snd_wnd = TCP_WND;
   /* As initial send MSS, we use TCP_MSS but limit it to 536.
@@ -1894,9 +1914,10 @@ tcp_alloc(u8_t prio)
     memset(pcb, 0, sizeof(struct tcp_pcb));
     pcb->prio = prio;
     pcb->snd_buf = TCP_SND_BUF;
+    pcb->rcv_wnd_max = tcp_wnd_runtime;
     /* Start with a window that does not need scaling. When window scaling is
        enabled and used, the window is enlarged when both sides agree on scaling. */
-    pcb->rcv_wnd = pcb->rcv_ann_wnd = TCPWND_MIN16(TCP_WND);
+    pcb->rcv_wnd = pcb->rcv_ann_wnd = TCPWND_MIN16(pcb->rcv_wnd_max);
     pcb->ttl = TCP_TTL;
     /* As initial send MSS, we use TCP_MSS but limit it to 536.
        The send MSS is updated when an MSS option is received. */

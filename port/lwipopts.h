@@ -107,6 +107,7 @@
 #define LWIP_CHKSUM_ALGORITHM 3
 
 #define PANDA_BASE_TCP_MSS 1460
+#define TCP_WND_RUNTIME_MIN (2 * PANDA_BASE_TCP_MSS)
 // Compile for the largest MSS used by the default desktop TUN MTU (9000).
 // The effective MSS is still capped at runtime by netif->mtu, so mobile and
 // 1500-byte TUNs continue to advertise 1460.
@@ -127,29 +128,38 @@
 #define TCP_WND (128 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
 #else
-// Desktop system TCP stacks auto-tune into much larger windows. Keep PandaCore
-// at the kernel's 256 KiB congestion-window scale without increasing either
-// mobile platform's per-flow memory budget.
+// Desktop system TCP stacks auto-tune into much larger windows.
 //
 // TCP_SND_BUF bounds the reverse (downlink) path: measured on the macOS
 // loopback TUN benchmark, the write->ACK loop turns around in ~50us, so the
 // old 64*MSS (91 KiB) send buffer capped reverse throughput at ~15 Gbit/s
-// with the core mostly idle. 256*MSS matches TCP_WND and lifts the ceiling
-// without touching the mobile tiers. TCP_SND_QUEUELEN must cover the
+// with the core mostly idle. 256*MSS lifts that ceiling without touching the
+// mobile tiers. TCP_SND_QUEUELEN must cover the
 // 1460-byte runtime MSS of 1500-MTU TUNs (256 segments per full buffer),
 // where the default formula in units of the 8960 compile-time MSS would
 // starve the queue before the buffer fills.
 #define LWIP_WND_SCALE 1
-// The effective receive window is min(TCP_WND, 65535 << TCP_RCV_SCALE), so
-// scale 3 silently capped it at 512 KiB while TCP_WND asked for 2.2 MiB.
+// The usable receive window is min(active window, 65535 << TCP_RCV_SCALE), so
+// scale 3 silently capped it at 512 KiB while the configuration asked for 2.2 MiB.
 // Nobody noticed on low-RTT paths, but a capture on a virtualised Windows
 // guest (where host scheduling inflates the TUN round trip to 3-6 ms) showed
 // the whole "deep-latency" degraded mode was just this: a smooth,
 // stall-free, window-limited flow at 512KiB/RTT — 0.65-0.96 Gbit/s with
 // near-zero CPU, raw window field topping out at 46720 (~373 KiB effective).
-// Scale 6 lets the full configured window through (65535 << 6 = 4 MiB cap).
+// Scale 6 raises the advertised-window ceiling to 4,194,240 bytes. Windows
+// needs a receive budget above 384 MSS to cross the virtualized TUN feedback
+// knee: same-window ABBA measured 384 MSS at 7.75-8.57 Gbit/s and 512 MSS at
+// 18.37-19.45 Gbit/s. Windows compiles the largest whole-MSS window that fits
+// scale 6 so runtime sweeps do not require rebuilding, while keeping 512 MSS
+// as the active default. PANDA_LWIP_TCP_RCV_WND_MSS selects the active value
+// once at process startup. macOS and Linux keep their existing fixed budget.
 #define TCP_RCV_SCALE 6
+#if defined(_WIN32)
+#define TCP_WND (2872 * PANDA_BASE_TCP_MSS)
+#define TCP_WND_RUNTIME_DEFAULT (512 * PANDA_BASE_TCP_MSS)
+#else
 #define TCP_WND (256 * PANDA_BASE_TCP_MSS)
+#endif
 #define TCP_SND_BUF (256 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_QUEUELEN 512
 #endif

@@ -17,6 +17,7 @@ void lwip_rs_tcp_endpoints(const struct tcp_pcb *pcb,
                            u16_t *local_port);
 void lwip_rs_tcp_apply_options(struct tcp_pcb *pcb, int keepalive);
 tcpwnd_size_t lwip_rs_tcp_send_buffer(const struct tcp_pcb *pcb);
+err_t lwip_rs_retry_tcp_output(void);
 
 void lwip_rs_udp_local_endpoint(const struct udp_pcb *pcb,
                                 ip_addr_t *local_ip,

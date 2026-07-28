@@ -1984,6 +1984,7 @@ tcp_rst_common(const struct tcp_pcb *pcb, u32_t seqno, u32_t ackno,
   struct pbuf *p;
   u16_t wnd;
   u8_t optlen;
+  tcpwnd_size_t rcv_wnd_max;
 
   LWIP_ASSERT("tcp_rst: invalid local_ip", local_ip != NULL);
   LWIP_ASSERT("tcp_rst: invalid remote_ip", remote_ip != NULL);
@@ -1992,11 +1993,12 @@ tcp_rst_common(const struct tcp_pcb *pcb, u32_t seqno, u32_t ackno,
   LWIP_UNUSED_ARG(remote_ip);
 
   optlen = LWIP_TCP_OPT_LENGTH_SEGMENT(0, pcb);
+  rcv_wnd_max = pcb != NULL ? pcb->rcv_wnd_max : tcp_wnd_runtime_get();
 
 #if LWIP_WND_SCALE
-  wnd = PP_HTONS(((TCP_WND >> TCP_RCV_SCALE) & 0xFFFF));
+  wnd = PP_HTONS(((rcv_wnd_max >> TCP_RCV_SCALE) & 0xFFFF));
 #else
-  wnd = PP_HTONS(TCP_WND);
+  wnd = PP_HTONS(rcv_wnd_max);
 #endif
 
   p = tcp_output_alloc_header_common(ackno, optlen, 0, lwip_htonl(seqno), local_port,
