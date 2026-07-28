@@ -120,7 +120,7 @@ fn parse_windows_udp_notify_mode(raw: Option<&OsStr>) -> Result<WindowsUdpNotify
 #[cfg(any(windows, test))]
 fn parse_windows_udp_reserve_mode(raw: Option<&OsStr>) -> Result<WindowsUdpReserveMode, String> {
     let Some(raw) = raw else {
-        return Ok(WindowsUdpReserveMode::Always);
+        return Ok(WindowsUdpReserveMode::OnBlock);
     };
     match raw
         .to_str()
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_udp_runtime_axis_parsers_are_strict_and_default_to_legacy_behavior() {
+    fn windows_udp_runtime_axis_parsers_are_strict_and_use_supported_defaults() {
         assert_eq!(
             parse_windows_udp_notify_mode(None).unwrap(),
             WindowsUdpNotifyMode::Legacy
@@ -898,7 +898,7 @@ mod tests {
         );
         assert_eq!(
             parse_windows_udp_reserve_mode(None).unwrap(),
-            WindowsUdpReserveMode::Always
+            WindowsUdpReserveMode::OnBlock
         );
         assert_eq!(
             parse_windows_udp_reserve_mode(Some("always".as_ref())).unwrap(),
