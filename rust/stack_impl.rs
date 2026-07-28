@@ -24,6 +24,8 @@ use super::{LWIPMutexGuard, LWIP_MUTEX};
 
 static LWIP_INIT: Once = Once::new();
 static EGRESS_BACKPRESSURED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LWIP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) const DEFAULT_MTU: u16 = 1500;
 const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
@@ -123,7 +125,8 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
     .map(|_| ())
     .map_err(|error| {
         super::Error::RuntimeConfig(format!("{TCP_RCV_WND_MSS_ENV}: {error}"))
-    })
+    })?;
+    super::udp::initialize_windows_udp_runtime_config()
 }
 
 #[cfg(not(windows))]
@@ -449,6 +452,9 @@ mod tests {
 
     #[test]
     fn netif_rejection_is_reported_without_panicking() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -588,6 +594,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn tcp_runtime_receive_window_rejects_values_below_two_base_mss() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = LWIP_MUTEX.lock();
         initialize_lwip();
 
@@ -603,6 +612,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn tcp_recved_stays_capped_at_the_runtime_receive_window() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = LWIP_MUTEX.lock();
         initialize_lwip();
 
