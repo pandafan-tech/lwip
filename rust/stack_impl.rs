@@ -30,6 +30,8 @@ pub(crate) const DEFAULT_MTU: u16 = 1500;
 const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
 const _: () = assert!(MEM_ALIGNMENT == 1);
+#[cfg(target_os = "ios")]
+const _: () = assert!(MEMP_NUM_TCP_PCB == 1024);
 #[cfg(windows)]
 const _: () = assert!(TCP_WND == 2872 * PANDA_BASE_TCP_MSS);
 #[cfg(windows)]
@@ -446,6 +448,37 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 assert_eq!(tcp_set_wnd_runtime(self.0), err_enum_t_ERR_OK as err_t);
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_pcb_pool_reaches_its_compiled_capacity_before_exhaustion() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = LWIP_MUTEX.lock();
+        initialize_lwip();
+
+        unsafe {
+            let capacity = MEMP_NUM_TCP_PCB as usize;
+            let mut pcbs = Vec::with_capacity(capacity);
+            for index in 0..capacity {
+                let pcb = tcp_new();
+                assert!(
+                    !pcb.is_null(),
+                    "TCP PCB pool exhausted at {index} of {capacity} configured slots"
+                );
+                pcbs.push(pcb);
+            }
+
+            assert!(
+                tcp_new().is_null(),
+                "TCP PCB pool exceeded its configured capacity of {capacity}"
+            );
+
+            for pcb in pcbs {
+                tcp_abort(pcb);
             }
         }
     }

@@ -76,7 +76,9 @@
 
 #if TARGET_OS_IPHONE
 #define LWIP_TCP_KEEPALIVE 1
-#define MEMP_NUM_TCP_PCB 256
+// Each slot is 264 bytes on arm64. 1024 active PCBs reserve 264 KiB while
+// leaving the Network Extension's TCP windows and 512 KiB heap unchanged.
+#define MEMP_NUM_TCP_PCB 1024
 #else
 #define MEMP_NUM_TCP_PCB 1024
 #endif
