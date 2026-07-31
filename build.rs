@@ -76,7 +76,26 @@ fn apple_clang_target() -> Option<String> {
     ))
 }
 
-fn compile_lwip() {
+const ANDROID_HOST_PROFILE_ENV: &str = "PANDA_LWIP_ANDROID_PROFILE";
+
+fn android_host_profile() -> bool {
+    println!("cargo:rerun-if-env-changed={ANDROID_HOST_PROFILE_ENV}");
+    let Some(value) = env::var_os(ANDROID_HOST_PROFILE_ENV) else {
+        return false;
+    };
+    assert_eq!(
+        value, "1",
+        "{ANDROID_HOST_PROFILE_ENV} must be exactly 1 when enabled"
+    );
+    assert_eq!(
+        env::var("CARGO_CFG_TARGET_OS").unwrap(),
+        "linux",
+        "{ANDROID_HOST_PROFILE_ENV} is only for runnable Linux regression builds"
+    );
+    true
+}
+
+fn compile_lwip(android_host_profile: bool) {
     println!("cargo:rerun-if-changed=src/core");
     println!("cargo:rerun-if-changed=src/include");
     println!("cargo:rerun-if-changed=port");
@@ -127,6 +146,9 @@ fn compile_lwip() {
     if let Some(sdk_include_path) = sdk_include_path() {
         build.include(sdk_include_path);
     }
+    if android_host_profile {
+        build.define("PANDA_LWIP_ANDROID_PROFILE", None);
+    }
     let target = env::var("TARGET").unwrap();
     if target == "aarch64-apple-tvos-sim" {
         let clang_target = apple_clang_target().unwrap();
@@ -140,7 +162,7 @@ fn compile_lwip() {
     build.compile("liblwip.a");
 }
 
-fn generate_lwip_bindings() {
+fn generate_lwip_bindings(android_host_profile: bool) {
     println!("cargo:rustc-link-lib=lwip");
     println!("cargo:include=src/include");
 
@@ -161,6 +183,9 @@ fn generate_lwip_bindings() {
     if let Some(sdk_include_path) = sdk_include_path {
         builder = builder.clang_arg(format!("-I{}", sdk_include_path));
     }
+    if android_host_profile {
+        builder = builder.clang_arg("-DPANDA_LWIP_ANDROID_PROFILE");
+    }
 
     if os == "windows" {
         builder = builder.size_t_is_usize(false);
@@ -175,7 +200,8 @@ fn generate_lwip_bindings() {
 }
 
 fn main() {
-    compile_lwip();
-    generate_lwip_bindings();
+    let android_host_profile = android_host_profile();
+    compile_lwip(android_host_profile);
+    generate_lwip_bindings(android_host_profile);
     println!("cargo:rerun-if-changed=build.rs");
 }

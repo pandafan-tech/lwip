@@ -124,11 +124,22 @@
 // receive/send budget conservative; the device-side TUN RTT is tiny.
 #define TCP_WND (32 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_BUF (16 * PANDA_BASE_TCP_MSS)
-#elif defined __ANDROID__
+// TCP_MSS is compiled for a possible 9000-byte desktop TUN, but mobile runs
+// at 1500 MTU. The lwIP default derives this queue from the oversized compile
+// MSS and cannot represent one full Rust write, causing tcp_write(ERR_MEM) to
+// repeat forever before any packet exists to produce an ACK/wakeup.
+#define TCP_SND_QUEUELEN \
+  ((4 * TCP_SND_BUF + (PANDA_BASE_TCP_MSS - 1)) / PANDA_BASE_TCP_MSS)
+#elif defined(__ANDROID__) || defined(PANDA_LWIP_ANDROID_PROFILE)
+// Host-side regression builds define PANDA_LWIP_ANDROID_PROFILE so the
+// runnable Linux TUN harness exercises Android's TCP memory limits without
+// pretending to be bionic at the libc-header boundary.
 #define LWIP_WND_SCALE 1
 #define TCP_RCV_SCALE 2
 #define TCP_WND (128 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_QUEUELEN \
+  ((4 * TCP_SND_BUF + (PANDA_BASE_TCP_MSS - 1)) / PANDA_BASE_TCP_MSS)
 #else
 // Desktop system TCP stacks auto-tune into much larger windows.
 //
@@ -180,7 +191,7 @@
 // BSS: untouched pages stay clean, idle RSS does not grow.
 #define MEM_SIZE (8 * 1024 * 1024)
 #endif
-#elif defined __ANDROID__
+#elif defined(__ANDROID__) || defined(PANDA_LWIP_ANDROID_PROFILE)
 // Mobile budget: keep the Android heap at its validated size; the desktop
 // send-buffer bump above does not apply to this tier either.
 #define MEM_SIZE (2 * 1024 * 1024)

@@ -484,6 +484,22 @@ mod tests {
     }
 
     #[test]
+    fn tcp_send_queue_can_segment_the_largest_rust_write_at_1500_mtu() {
+        let write_bytes = (TCP_SND_BUF as usize).min(u16::MAX as usize);
+        let base_mss = PANDA_BASE_TCP_MSS as usize;
+        let required_segments = write_bytes.div_ceil(base_mss);
+
+        assert!(
+            TCP_SND_QUEUELEN as usize >= required_segments,
+            "TCP_SND_QUEUELEN={} cannot segment the {}-byte write into {}-byte MSS packets; \
+             TcpStreamImpl::poll_write would repeat ERR_MEM without sending data",
+            TCP_SND_QUEUELEN,
+            write_bytes,
+            base_mss,
+        );
+    }
+
+    #[test]
     fn netif_rejection_is_reported_without_panicking() {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
@@ -678,7 +694,7 @@ mod tests {
             assert_eq!((*initial_pcb).rcv_wnd, initial_window);
             tcp_abort(initial_pcb);
 
-            let active_window = 128 * PANDA_BASE_TCP_MSS;
+            let active_window = (128 * PANDA_BASE_TCP_MSS).min(TCP_WND - PANDA_BASE_TCP_MSS);
             assert_eq!(
                 tcp_set_wnd_runtime(active_window),
                 err_enum_t_ERR_OK as err_t
