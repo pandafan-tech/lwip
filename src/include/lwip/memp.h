@@ -39,6 +39,7 @@
 #define LWIP_HDR_MEMP_H
 
 #include "lwip/opt.h"
+#include "lwip/err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +60,36 @@ typedef enum {
 #include "lwip/stats.h"
 
 extern const struct memp_desc* const memp_pools[MEMP_MAX];
+
+/** Smallest supported runtime-active PBUF_POOL size. */
+#define MEMP_PBUF_POOL_RUNTIME_MIN 32U
+
+/** Runtime state for the compile-time-sized PBUF_POOL. */
+struct memp_pbuf_pool_runtime_stats {
+  u16_t configured;
+  u16_t effective;
+  u16_t compile_capacity;
+  u16_t used;
+  u16_t max_used;
+  u32_t alloc_failures;
+};
+
+/**
+ * Configure how many PBUF_POOL slots are linked into the active pool.
+ *
+ * This must be called before memp_init(). The backing storage remains sized by
+ * PBUF_POOL_SIZE; inactive slots are left untouched in zero-filled BSS.
+ *
+ * Reapplying the effective capacity after initialization is an idempotent
+ * success. Any attempt to change it after initialization returns ERR_USE.
+ *
+ * @return ERR_OK on success, ERR_VAL outside the supported range before
+ *         initialization, or ERR_USE for a post-initialization change.
+ */
+err_t memp_pbuf_pool_set_capacity(u16_t capacity);
+
+/** Copy the current PBUF_POOL runtime state into @p stats. */
+void memp_pbuf_pool_get_runtime_stats(struct memp_pbuf_pool_runtime_stats *stats);
 
 /**
  * @ingroup mempool

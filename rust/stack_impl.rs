@@ -137,6 +137,7 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
 }
 
 fn initialize_lwip() {
+    let _guard = LWIP_MUTEX.lock();
     initialize_windows_runtime_config().unwrap_or_else(|error| panic!("{error}"));
     LWIP_INIT.call_once(|| unsafe { lwip_init() });
 }
@@ -457,8 +458,8 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = LWIP_MUTEX.lock();
         initialize_lwip();
+        let _guard = LWIP_MUTEX.lock();
 
         unsafe {
             let capacity = MEMP_NUM_TCP_PCB as usize;
@@ -646,8 +647,8 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = LWIP_MUTEX.lock();
         initialize_lwip();
+        let _guard = LWIP_MUTEX.lock();
 
         unsafe {
             let _restore = TcpWndRuntimeRestore(TCP_WND);
@@ -664,8 +665,8 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _guard = LWIP_MUTEX.lock();
         initialize_lwip();
+        let _guard = LWIP_MUTEX.lock();
 
         unsafe {
             let original_window = TCP_WND;

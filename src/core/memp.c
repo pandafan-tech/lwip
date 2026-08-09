@@ -83,6 +83,86 @@ const struct memp_desc *const memp_pools[MEMP_MAX] = {
 #include "lwip/priv/memp_std.h"
 };
 
+struct memp_pbuf_pool_runtime_state {
+  u16_t configured;
+  u16_t effective;
+#if !MEMP_STATS
+  u16_t used;
+  u16_t max_used;
+  u32_t alloc_failures;
+#endif
+  u8_t initialization_started;
+};
+
+static struct memp_pbuf_pool_runtime_state memp_pbuf_pool_runtime = {
+  PBUF_POOL_SIZE,
+  0,
+#if !MEMP_STATS
+  0,
+  0,
+  0,
+#endif
+  0
+};
+
+static int
+memp_is_pbuf_pool(const struct memp_desc *desc)
+{
+  return desc == memp_pools[MEMP_PBUF_POOL];
+}
+
+#if !MEMP_MEM_MALLOC
+static u16_t
+memp_pool_effective_num(const struct memp_desc *desc)
+{
+  if (memp_is_pbuf_pool(desc)) {
+    return memp_pbuf_pool_runtime.effective != 0 ?
+      memp_pbuf_pool_runtime.effective : memp_pbuf_pool_runtime.configured;
+  }
+  return desc->num;
+}
+#endif
+
+err_t
+memp_pbuf_pool_set_capacity(u16_t capacity)
+{
+  if (memp_pbuf_pool_runtime.initialization_started) {
+    return capacity == memp_pbuf_pool_runtime.configured ? ERR_OK : ERR_USE;
+  }
+#if MEMP_MEM_MALLOC
+  LWIP_UNUSED_ARG(capacity);
+  return ERR_VAL;
+#else
+  if ((capacity < MEMP_PBUF_POOL_RUNTIME_MIN) || (capacity > PBUF_POOL_SIZE)) {
+    return ERR_VAL;
+  }
+  memp_pbuf_pool_runtime.configured = capacity;
+  return ERR_OK;
+#endif
+}
+
+void
+memp_pbuf_pool_get_runtime_stats(struct memp_pbuf_pool_runtime_stats *stats)
+{
+  LWIP_ASSERT("memp_pbuf_pool_get_runtime_stats: stats != NULL", stats != NULL);
+  if (stats == NULL) {
+    return;
+  }
+
+  stats->configured = memp_pbuf_pool_runtime.configured;
+  stats->effective = memp_pbuf_pool_runtime.effective;
+  stats->compile_capacity = PBUF_POOL_SIZE;
+#if MEMP_STATS
+  stats->used = memp_pools[MEMP_PBUF_POOL]->stats->used;
+  stats->max_used = memp_pools[MEMP_PBUF_POOL]->stats->max;
+  stats->alloc_failures = memp_pools[MEMP_PBUF_POOL]->stats->err;
+#else
+  stats->used = memp_pbuf_pool_runtime.used;
+  stats->max_used = memp_pbuf_pool_runtime.max_used;
+  stats->alloc_failures = memp_pbuf_pool_runtime.alloc_failures;
+#endif
+}
+
 #ifdef LWIP_HOOK_FILENAME
 #include LWIP_HOOK_FILENAME
 #endif
@@ -155,7 +235,7 @@ memp_overflow_check_all(void)
 
   for (i = 0; i < MEMP_MAX; ++i) {
     p = (struct memp *)LWIP_MEM_ALIGN(memp_pools[i]->base);
-    for (j = 0; j < memp_pools[i]->num; ++j) {
+    for (j = 0; j < memp_pool_effective_num(memp_pools[i]); ++j) {
       memp_overflow_check_element(p, memp_pools[i]);
       p = LWIP_ALIGNMENT_CAST(struct memp *, ((u8_t *)p + MEMP_SIZE + memp_pools[i]->size + MEM_SANITY_REGION_AFTER_ALIGNED));
     }
@@ -178,20 +258,27 @@ memp_init_pool(const struct memp_desc *desc)
   LWIP_UNUSED_ARG(desc);
 #else
   int i;
+  u16_t num;
   struct memp *memp;
+
+  if (memp_is_pbuf_pool(desc)) {
+    memp_pbuf_pool_runtime.initialization_started = 1;
+    memp_pbuf_pool_runtime.effective = memp_pbuf_pool_runtime.configured;
+  }
+  num = memp_pool_effective_num(desc);
 
   *desc->tab = NULL;
   memp = (struct memp *)LWIP_MEM_ALIGN(desc->base);
 #if MEMP_MEM_INIT
   /* force memset on pool memory */
-  memset(memp, 0, (size_t)desc->num * (MEMP_SIZE + desc->size
+  memset(memp, 0, (size_t)num * (MEMP_SIZE + desc->size
 #if MEMP_OVERFLOW_CHECK
                                        + MEM_SANITY_REGION_AFTER_ALIGNED
 #endif
                                       ));
 #endif
   /* create a linked list of memp elements */
-  for (i = 0; i < desc->num; ++i) {
+  for (i = 0; i < num; ++i) {
     memp->next = *desc->tab;
     *desc->tab = memp;
 #if MEMP_OVERFLOW_CHECK
@@ -205,7 +292,7 @@ memp_init_pool(const struct memp_desc *desc)
                                   );
   }
 #if MEMP_STATS
-  desc->stats->avail = desc->num;
+  desc->stats->avail = num;
 #endif /* MEMP_STATS */
 #endif /* !MEMP_MEM_MALLOC */
 
@@ -224,6 +311,8 @@ void
 memp_init(void)
 {
   u16_t i;
+
+  memp_pbuf_pool_runtime.initialization_started = 1;
 
   /* for every pool: */
   for (i = 0; i < LWIP_ARRAYSIZE(memp_pools); i++) {
@@ -284,6 +373,13 @@ do_memp_malloc_pool_fn(const struct memp_desc *desc, const char *file, const int
     if (desc->stats->used > desc->stats->max) {
       desc->stats->max = desc->stats->used;
     }
+#else
+    if (memp_is_pbuf_pool(desc)) {
+      memp_pbuf_pool_runtime.used++;
+      if (memp_pbuf_pool_runtime.used > memp_pbuf_pool_runtime.max_used) {
+        memp_pbuf_pool_runtime.max_used = memp_pbuf_pool_runtime.used;
+      }
+    }
 #endif
     SYS_ARCH_UNPROTECT(old_level);
     /* cast through u8_t* to get rid of alignment warnings */
@@ -291,6 +387,10 @@ do_memp_malloc_pool_fn(const struct memp_desc *desc, const char *file, const int
   } else {
 #if MEMP_STATS
     desc->stats->err++;
+#else
+    if (memp_is_pbuf_pool(desc)) {
+      memp_pbuf_pool_runtime.alloc_failures++;
+    }
 #endif
     SYS_ARCH_UNPROTECT(old_level);
     LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: out of memory in pool %s\n", desc->desc));
@@ -375,6 +475,11 @@ do_memp_free_pool(const struct memp_desc *desc, void *mem)
 
 #if MEMP_STATS
   desc->stats->used--;
+#else
+  if (memp_is_pbuf_pool(desc)) {
+    LWIP_ASSERT("memp_free: PBUF_POOL used > 0", memp_pbuf_pool_runtime.used > 0);
+    memp_pbuf_pool_runtime.used--;
+  }
 #endif
 
 #if MEMP_MEM_MALLOC

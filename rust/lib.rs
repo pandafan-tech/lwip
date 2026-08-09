@@ -4,6 +4,7 @@ mod lwip;
 mod mutex;
 mod output;
 mod packet;
+mod pbuf_pool;
 mod stack;
 mod stack_impl;
 mod tcp_listener;
@@ -20,6 +21,7 @@ pub(crate) use mutex::AtomicMutexGuard as LWIPMutexGuard;
 pub use packet::{
     packet_pool_runtime_stats, trim_packet_pools, IpPacket, PacketPool, PacketPoolsRuntimeStats,
 };
+pub use pbuf_pool::{configure_pbuf_pool_capacity, pbuf_pool_runtime_stats, PbufPoolRuntimeStats};
 pub use stack::{NetStack, StackEgress, StackIngress};
 pub use stack_impl::initialize_windows_runtime_config;
 pub use tcp_listener::TcpListener;
