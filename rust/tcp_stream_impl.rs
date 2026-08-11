@@ -569,13 +569,19 @@ mod tests {
         assert!(matches!(poll, Poll::Pending));
         {
             let _guard = LWIP_MUTEX.lock();
-            assert_eq!(unsafe { crate::tcp_stream_context::pressure_queue_len_locked() }, 1);
+            assert_eq!(
+                unsafe { crate::tcp_stream_context::pressure_queue_len_locked() },
+                1
+            );
         }
 
         drop(victim);
         {
             let _guard = LWIP_MUTEX.lock();
-            assert_eq!(unsafe { crate::tcp_stream_context::pressure_queue_len_locked() }, 0);
+            assert_eq!(
+                unsafe { crate::tcp_stream_context::pressure_queue_len_locked() },
+                0
+            );
         }
 
         let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap());
