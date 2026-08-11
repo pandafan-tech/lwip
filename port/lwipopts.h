@@ -122,16 +122,18 @@
 
 #define PANDA_BASE_TCP_MSS 1460
 #define TCP_WND_RUNTIME_MIN (2 * PANDA_BASE_TCP_MSS)
-// Compile for the largest MSS used by the default desktop TUN MTU (9000).
-// The effective MSS is still capped at runtime by netif->mtu, so mobile and
-// 1500-byte TUNs continue to advertise 1460.
-//
-// A 65095 MSS for 65535-MTU Linux TUNs was measured (2026-07-25) and gained
-// nothing: PandaCore stayed at 24.4 Gbit/s while the kernel-TCP comparison
-// scaled to 40.9. The forward path is serialization-bound at ~0.5 cores,
-// not segment-bound, so a bigger MSS only costs memory.
-#define TCP_MSS 8960
+// The smallest effective MSS any runtime MTU can produce (RFC 879 default;
+// TCP_CALCULATE_EFF_SEND_MSS floors there). Queue limits sized with this
+// divisor stay sufficient for EVERY runtime MTU — sizing them in units of
+// the compile-time ceiling instead is the classic tun2socks failure mode
+// where a small-MTU run needs more segments per buffer than the queue
+// allows and every tcp_write dies on ERR_MEM.
+#define PANDA_MIN_EFF_TCP_MSS 536
 #if defined __APPLE__ && TARGET_OS_IPHONE
+// Mobile ceiling stays at the 9000-MTU value: NE runs at 1500 so only the
+// ceiling-derived sanity margins matter, and keeping it fixed keeps the
+// mobile memory profile byte-identical.
+#define TCP_MSS 8960
 // Network Extension has a tight process-memory ceiling. Keep the mobile
 // receive/send budget conservative; the device-side TUN RTT is tiny.
 #define TCP_WND (32 * PANDA_BASE_TCP_MSS)
@@ -146,6 +148,7 @@
 // Host-side regression builds define PANDA_LWIP_ANDROID_PROFILE so the
 // runnable Linux TUN harness exercises Android's TCP memory limits without
 // pretending to be bionic at the libc-header boundary.
+#define TCP_MSS 8960
 #define LWIP_WND_SCALE 1
 #define TCP_RCV_SCALE 2
 #define TCP_WND (128 * PANDA_BASE_TCP_MSS)
@@ -178,6 +181,26 @@
 // scale 6 so runtime sweeps do not require rebuilding, while keeping 512 MSS
 // as the active default. PANDA_LWIP_TCP_RCV_WND_MSS selects the active value
 // once at process startup. macOS and Linux keep their existing fixed budget.
+//
+// Desktop MSS ceiling: the effective MSS is min(TCP_MSS, netif->mtu - 40)
+// per connection, so this only sets how far the runtime `tun.mtu` knob can
+// reach. 16382 is the LARGEST value upstream lwIP's sanity checks admit —
+// beyond it, init.c #errors because parts of the TCP machinery still do
+// u16 arithmetic in MSS multiples: TCP_MSS must stay under 16383, and
+// TCP_SNDLOWAT + 4*TCP_MSS must stay under 65535, which with our 2920-byte
+// SNDLOWAT caps the ceiling at 15653. Going to a 64K-class ceiling
+// therefore requires auditing that machinery first, not just raising this
+// number. Windows/buffers are sized in
+// PANDA_BASE_TCP_MSS byte units on purpose: they do NOT scale with this
+// ceiling, so raising it costs no memory at small runtime MTUs.
+// (A 2026-07-25 measurement concluded a 65095 MSS "gains nothing" — that
+// predates the libc-malloc heap, the pressure queue, checksum offload, RX
+// handoff, and sharding; in that regime the producer was serialization-
+// bound at ~0.5 cores. After those landed, MTU 4000->9000 alone DOUBLED
+// bidirectional throughput, so the segment-size lever is live again and
+// the ceiling is runtime-selectable up to the sanity-check limit:
+// tun.mtu 576..15680 all map to working configurations at runtime.)
+#define TCP_MSS 15640
 #define TCP_RCV_SCALE 6
 #if defined(_WIN32)
 #define TCP_WND (2872 * PANDA_BASE_TCP_MSS)
@@ -186,7 +209,14 @@
 #define TCP_WND (256 * PANDA_BASE_TCP_MSS)
 #endif
 #define TCP_SND_BUF (256 * PANDA_BASE_TCP_MSS)
-#define TCP_SND_QUEUELEN 512
+// Sized for the smallest runtime MSS (see PANDA_MIN_EFF_TCP_MSS): a full
+// send buffer at MSS 536 needs ~698 segments and interleaved partial
+// segments push past that; the previous fixed 512 starved exactly there
+// (any tun.mtu below ~1000 could wedge tcp_write on ERR_MEM with the
+// buffer nowhere near full). This is a limit, not an allocation — the
+// segment pool (MEMP_NUM_TCP_SEG) still bounds real memory.
+#define TCP_SND_QUEUELEN \
+  ((4 * TCP_SND_BUF + (PANDA_MIN_EFF_TCP_MSS - 1)) / PANDA_MIN_EFF_TCP_MSS)
 #endif
 #define TCP_SNDLOWAT (2 * PANDA_BASE_TCP_MSS)
 #define TCP_KEEPIDLE_DEFAULT 30000UL

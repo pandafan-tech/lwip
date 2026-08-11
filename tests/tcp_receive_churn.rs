@@ -184,6 +184,41 @@ fn configured_mtu_controls_advertised_tcp_mss() {
         });
 }
 
+/// The whole segment-granularity lever is runtime `tun.mtu`: the advertised
+/// MSS must track the configured MTU across the full supported range — the
+/// compile ceiling at the top, the RFC-879 floor at the bottom — with no
+/// rebuild. (The ceiling case would silently pin at 8960 if the compile
+/// constant regressed; the floor case would wedge on ERR_MEM if the send
+/// queue were sized in ceiling units, the classic tun2socks failure.)
+#[test]
+fn runtime_mtu_reaches_the_compile_ceiling_and_floor() {
+    let _test_guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            const SYN: u8 = 0x02;
+            for (mtu, expected_mss, source_port) in
+                [(15_680u16, 15_640u16, 10_101u16), (576, 536, 10_102)]
+            {
+                let (stack, listener, udp) = NetStack::with_buffer_size_and_mtu(8, 8, mtu).unwrap();
+                drop(udp);
+                let (mut ingress, mut egress) = stack.split();
+                ingress.input_batch([ipv4_tcp_packet(source_port, 1, 0, SYN, &[])]);
+                let syn_ack = next_syn_ack(&mut egress, source_port).await;
+                assert_eq!(
+                    tcp_mss_option(&syn_ack),
+                    Some(expected_mss),
+                    "advertised MSS must track tun.mtu {mtu}"
+                );
+                drop(listener);
+            }
+        });
+}
+
 async fn establish_tcp_stream(
     ingress: &mut lwip::StackIngress,
     egress: &mut lwip::StackEgress,
