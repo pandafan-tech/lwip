@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use super::packet::IpPacket;
+use super::lwip::{pbuf, pbuf_free};
 use super::LWIPMutexGuard;
 
 const TCP_READ_QUEUE_INITIAL_CAPACITY: usize = 32;
@@ -31,30 +31,60 @@ pub fn tcp_runtime_stats() -> TcpRuntimeStats {
     }
 }
 
-pub struct QueuedTcpPacket {
-    packet: IpPacket,
+/// A pbuf chain surrendered by lwIP's receive callback, owned exclusively by
+/// the reading stream. Handing the chain across the lock boundary instead of
+/// copying it keeps the payload memcpy out of the global critical section AND
+/// off the ingress path entirely — the copy runs on the reader's worker at
+/// `poll_read` time. The payload bytes are stable without the lock (lwIP gave
+/// up every reference), but the chain must be RETURNED under `LWIP_MUTEX`:
+/// `pbuf_free` walks refcounts, pools, and custom-free hooks that only the
+/// lock serializes. Every holder frees through [`QueuedPbuf::free_locked`].
+pub struct QueuedPbuf {
+    head: *mut pbuf,
+    bytes: usize,
 }
 
-impl QueuedTcpPacket {
-    pub fn new(packet: IpPacket) -> Self {
+// SAFETY: the chain is exclusively owned (lwIP surrendered it to the receive
+// callback), payload reads need no lock, and every free happens under
+// LWIP_MUTEX via free_locked. Sync is equally sound: no shared-reference
+// method dereferences the chain — mutation and traversal go through
+// exclusive ownership only.
+unsafe impl Send for QueuedPbuf {}
+unsafe impl Sync for QueuedPbuf {}
+
+impl QueuedPbuf {
+    /// # Safety
+    /// `head` must be a pbuf chain the caller exclusively owns — fresh from
+    /// lwIP's `tcp_recv` callback, which transfers ownership to the callee.
+    pub unsafe fn new(head: *mut pbuf) -> Self {
+        let bytes = usize::from(std::ptr::read_unaligned(head).tot_len);
         TCP_QUEUED_PACKETS.fetch_add(1, Ordering::Relaxed);
-        TCP_QUEUED_BYTES.fetch_add(packet.len(), Ordering::Relaxed);
-        Self { packet }
+        TCP_QUEUED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        Self { head, bytes }
+    }
+
+    pub fn head(&self) -> *mut pbuf {
+        self.head
+    }
+
+    /// Return the chain to lwIP; the guard witnesses that the lock is held.
+    pub fn free_locked(mut self, _guard: &LWIPMutexGuard) {
+        unsafe { pbuf_free(self.head) };
+        self.head = std::ptr::null_mut();
     }
 }
 
-impl Deref for QueuedTcpPacket {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.packet
-    }
-}
-
-impl Drop for QueuedTcpPacket {
+impl Drop for QueuedPbuf {
     fn drop(&mut self) {
         TCP_QUEUED_PACKETS.fetch_sub(1, Ordering::Relaxed);
-        TCP_QUEUED_BYTES.fetch_sub(self.packet.len(), Ordering::Relaxed);
+        TCP_QUEUED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+        // A chain dropped without free_locked cannot be freed here — this
+        // Drop is not guaranteed to run under the lock. Leaking it is the
+        // safe failure; debug builds refuse to let the path exist.
+        debug_assert!(
+            self.head.is_null(),
+            "QueuedPbuf dropped without free_locked; pbuf chain leaked"
+        );
     }
 }
 
@@ -75,7 +105,7 @@ impl Drop for ActiveTcpStream {
 
 pub struct TcpStreamContextInner {
     pub local_addr: SocketAddr,
-    pub read_queue: VecDeque<QueuedTcpPacket>,
+    pub read_queue: VecDeque<QueuedPbuf>,
     pub read_waker: Option<Waker>,
     pub read_eof: bool,
     pub errored: bool,

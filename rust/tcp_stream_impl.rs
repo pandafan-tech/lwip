@@ -1,25 +1,16 @@
-use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin, sync::Arc, sync::OnceLock};
+use std::{cmp::min, io, net::SocketAddr, os::raw, pin::Pin};
 
 use futures::task::{Context, Poll};
 use log::*;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::lwip::*;
-use super::packet::PacketPool;
 use super::tcp_stream_context::{
     pressure_park_locked, pressure_remove_locked, pressure_unpark_all_locked,
-    pressure_unpark_one_locked, ActiveTcpStream, QueuedTcpPacket, TcpStreamContext,
+    pressure_unpark_one_locked, ActiveTcpStream, QueuedPbuf, TcpStreamContext,
 };
 use super::util;
 use super::LWIP_MUTEX;
-
-const TCP_PACKET_CACHE: usize = 16;
-const TCP_PACKET_MAX_CAPACITY: usize = u16::MAX as usize;
-static TCP_PACKET_POOL: OnceLock<Arc<PacketPool>> = OnceLock::new();
-
-fn tcp_packet_pool() -> &'static Arc<PacketPool> {
-    TCP_PACKET_POOL.get_or_init(|| PacketPool::new(TCP_PACKET_CACHE, TCP_PACKET_MAX_CAPACITY))
-}
 
 #[allow(unused_variables)]
 pub unsafe extern "C" fn tcp_recv_cb(
@@ -47,26 +38,20 @@ pub unsafe extern "C" fn tcp_recv_cb(
         return err_enum_t_ERR_OK as err_t;
     }
 
-    let pbuflen = std::ptr::read_unaligned(p).tot_len;
-    let mut packet = tcp_packet_pool().acquire(pbuflen as usize);
-    let copied = pbuf_copy_partial(
-        p,
-        packet.spare_capacity_mut().as_mut_ptr().cast(),
-        pbuflen,
-        0,
-    );
-    pbuf_free(p);
-    if copied != pbuflen {
-        warn!("short lwIP TCP pbuf copy: {copied}/{pbuflen}");
+    // Hand the chain to the reader instead of copying it: the memcpy then
+    // runs in poll_read's unlocked phase on the reader's worker, off both
+    // the global critical section and the ingress path. lwIP transferred
+    // ownership of `p` to this callback; the reader returns it via
+    // free_locked in a later locked phase.
+    if std::ptr::read_unaligned(p).tot_len == 0 {
+        // tcp_recv_cb runs under LWIP_MUTEX (called from tcp_input), so the
+        // immediate free is already serialized.
+        pbuf_free(p);
         return err_enum_t_ERR_OK as err_t;
     }
-    packet.set_len(pbuflen as usize);
-
-    if !packet.is_empty() {
-        ctx.read_queue.push_back(QueuedTcpPacket::new(packet));
-        if let Some(waker) = ctx.read_waker.take() {
-            waker.wake();
-        }
+    ctx.read_queue.push_back(QueuedPbuf::new(p));
+    if let Some(waker) = ctx.read_waker.take() {
+        waker.wake();
     }
 
     err_enum_t_ERR_OK as err_t
@@ -125,18 +110,35 @@ pub extern "C" fn tcp_poll_cb(arg: *mut ::std::os::raw::c_void, tpcb: *mut tcp_p
     err_enum_t_ERR_OK as err_t
 }
 
+// The pbuf chain being copied out to the caller, with a cursor into it.
+// SAFETY of the Send impl: the chain is exclusively owned (see QueuedPbuf);
+// `node` only ever points inside that owned chain.
+struct PbufCursor {
+    chain: QueuedPbuf,
+    node: *mut pbuf,
+    node_off: usize,
+}
+
+unsafe impl Send for PbufCursor {}
+// SAFETY: same as QueuedPbuf — no shared-reference path dereferences `node`.
+unsafe impl Sync for PbufCursor {}
+
 pub struct TcpStreamImpl {
     src_addr: SocketAddr,
     dest_addr: SocketAddr,
     pcb: usize,
-    read_buf: Option<(QueuedTcpPacket, usize)>,
-    // Segments already claimed from the shared read_queue but not yet copied
+    read_buf: Option<PbufCursor>,
+    // Chains already claimed from the shared read_queue but not yet copied
     // out. Draining into this under the lock and copying from it after
     // releasing keeps the memcpy out of the global critical section — with
     // the copy inside it, a relay pulling tens of kilobytes stalls the whole
     // stack's input path for the duration, which on a preemption-prone host
     // is what feeds the spin-yield contention storm.
-    staged: std::collections::VecDeque<QueuedTcpPacket>,
+    staged: std::collections::VecDeque<QueuedPbuf>,
+    // Fully copied chains awaiting their locked return to lwIP; freed in the
+    // next poll's locked phase (or in Drop). Owned by the single reader
+    // task, so no lock guards it.
+    spent: Vec<QueuedPbuf>,
     // Bytes copied out to the reader whose tcp_recved window credit has not
     // been granted yet; flushed at the start of the next poll_read's locked
     // phase. Owned by the single reader task, so no lock guards it.
@@ -172,6 +174,7 @@ impl TcpStreamImpl {
                 pcb: pcb as usize,
                 read_buf: None,
                 staged: std::collections::VecDeque::new(),
+                spent: Vec::new(),
                 pending_recved: 0,
                 callback_ctx: TcpStreamContext::new(src_addr),
                 _active: ActiveTcpStream::new(),
@@ -219,17 +222,21 @@ impl AsyncRead for TcpStreamImpl {
     ) -> Poll<io::Result<()>> {
         let me = &mut *self;
 
-        // Locked phase one: flush the receive-window credit from the previous
-        // poll, claim everything queued, and register the waker if there is
-        // nothing to deliver. No copying happens under the lock. Folding
-        // tcp_recved into this tenure (instead of a dedicated post-copy lock)
-        // halves the reader's lock entries; the window opens one poll later,
-        // which a 256-MSS receive window never notices, and a reader that
-        // stalls on upstream backpressure keeps the window closed — which is
-        // exactly the flow control lwIP should see.
+        // Locked phase one: return the chains consumed by the previous poll,
+        // flush that poll's receive-window credit, claim everything queued,
+        // and register the waker if there is nothing to deliver. No copying
+        // happens under the lock. Folding tcp_recved into this tenure
+        // (instead of a dedicated post-copy lock) halves the reader's lock
+        // entries; the window opens one poll later, which a 256-MSS receive
+        // window never notices, and a reader that stalls on upstream
+        // backpressure keeps the window closed — which is exactly the flow
+        // control lwIP should see.
         let read_eof;
         {
             let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_READ);
+            for chain in me.spent.drain(..) {
+                chain.free_locked(&guard);
+            }
             let ctx = &mut *me.callback_ctx.with_lock(&guard);
             if ctx.errored {
                 return Poll::Ready(Err(broken_pipe()));
@@ -241,8 +248,8 @@ impl AsyncRead for TcpStreamImpl {
                 }
                 me.pending_recved -= acknowledged;
             }
-            while let Some(data) = ctx.read_queue.pop_front() {
-                me.staged.push_back(data);
+            while let Some(chain) = ctx.read_queue.pop_front() {
+                me.staged.push_back(chain);
             }
             read_eof = ctx.read_eof;
             if me.read_buf.is_none() && me.staged.is_empty() && !read_eof {
@@ -258,34 +265,58 @@ impl AsyncRead for TcpStreamImpl {
             }
         }
 
-        // Unlocked phase: copy into the caller's buffer.
+        // Unlocked phase: copy into the caller's buffer straight from the
+        // owned pbuf chains. Safe without the lock: lwIP surrendered every
+        // reference to these chains in the receive callback.
         let mut consumed = 0usize;
         let result = loop {
             if buf.remaining() == 0 {
                 break Poll::Ready(Ok(()));
             }
 
-            if me.read_buf.is_none() {
-                if let Some(data) = me.staged.pop_front() {
-                    me.read_buf = Some((data, 0));
-                } else {
-                    // Everything staged was delivered; either this poll made
-                    // progress or the peer closed.
-                    debug_assert!(read_eof || consumed > 0);
-                    break Poll::Ready(Ok(()));
-                }
-            }
+            let cursor = match me.read_buf.as_mut() {
+                Some(cursor) => cursor,
+                None => match me.staged.pop_front() {
+                    Some(chain) => {
+                        let node = chain.head();
+                        me.read_buf.insert(PbufCursor {
+                            chain,
+                            node,
+                            node_off: 0,
+                        })
+                    }
+                    None => {
+                        // Everything staged was delivered; either this poll
+                        // made progress or the peer closed.
+                        debug_assert!(read_eof || consumed > 0);
+                        break Poll::Ready(Ok(()));
+                    }
+                },
+            };
 
-            let (data, offset) = me
-                .read_buf
-                .as_mut()
-                .expect("TCP read buffer is present after dequeue");
-            let to_read = min(buf.remaining(), data.len() - *offset);
-            buf.put_slice(&data[*offset..*offset + to_read]);
-            *offset += to_read;
-            consumed += to_read;
-            if *offset == data.len() {
-                me.read_buf.take();
+            let (payload, node_len, next) = unsafe {
+                let node = std::ptr::read_unaligned(cursor.node);
+                (node.payload.cast::<u8>(), usize::from(node.len), node.next)
+            };
+            let to_read = min(buf.remaining(), node_len - cursor.node_off);
+            if to_read > 0 {
+                unsafe {
+                    buf.put_slice(std::slice::from_raw_parts(
+                        payload.add(cursor.node_off),
+                        to_read,
+                    ));
+                }
+                cursor.node_off += to_read;
+                consumed += to_read;
+            }
+            if cursor.node_off == node_len {
+                if next.is_null() {
+                    let finished = me.read_buf.take().expect("cursor just borrowed");
+                    me.spent.push(finished.chain);
+                } else {
+                    cursor.node = next;
+                    cursor.node_off = 0;
+                }
             }
         };
 
@@ -300,9 +331,24 @@ impl AsyncRead for TcpStreamImpl {
 impl Drop for TcpStreamImpl {
     fn drop(&mut self) {
         let guard = LWIP_MUTEX.lock();
+        // Return every pbuf chain this stream still owns while the lock is
+        // held: undelivered (staged), mid-copy (read_buf), consumed-but-not-
+        // yet-returned (spent), and never-claimed (ctx.read_queue below).
+        for chain in self.staged.drain(..) {
+            chain.free_locked(&guard);
+        }
+        if let Some(cursor) = self.read_buf.take() {
+            cursor.chain.free_locked(&guard);
+        }
+        for chain in self.spent.drain(..) {
+            chain.free_locked(&guard);
+        }
         {
             let mut ctx = self.callback_ctx.with_lock(&guard);
             trace!("netstack tcp drop {}", ctx.local_addr);
+            for chain in ctx.read_queue.drain(..) {
+                chain.free_locked(&guard);
+            }
             // The context is about to be freed with the stream; it must leave
             // the pressure queue while the pointer is still valid.
             unsafe {
@@ -440,6 +486,7 @@ mod tests {
     use super::*;
     use crate::stack_impl::LWIP_TEST_LOCK;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::task::{Wake, Waker};
 
     struct WakeCounter(AtomicUsize);
@@ -724,5 +771,128 @@ mod tests {
                 "the next poll's locked phase grants the deferred credit"
             );
         }
+    }
+
+    /// Payload bytes must survive the pbuf handoff exactly — including a
+    /// chained delivery read out through a buffer smaller than either node,
+    /// which forces cursor advances both inside a node and across the link.
+    #[test]
+    fn chained_pbuf_delivery_survives_partial_reads() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stack_impl::initialize_lwip();
+
+        let (mut stream, pcb) = {
+            let _guard = LWIP_MUTEX.lock();
+            let pcb = unsafe { fake_established_pcb() };
+            (TcpStreamImpl::new(pcb), pcb)
+        };
+
+        const FIRST: usize = 1100;
+        const SECOND: usize = 900;
+        let mut expected = Vec::with_capacity(FIRST + SECOND);
+        expected.extend((0..FIRST).map(|i| (i % 251) as u8));
+        expected.extend((0..SECOND).map(|i| (i.wrapping_mul(7) % 253) as u8));
+
+        {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe {
+                let a = pbuf_alloc(pbuf_layer_PBUF_RAW, FIRST as u16, pbuf_type_PBUF_RAM);
+                let b = pbuf_alloc(pbuf_layer_PBUF_RAW, SECOND as u16, pbuf_type_PBUF_RAM);
+                assert!(!a.is_null() && !b.is_null());
+                std::ptr::copy_nonoverlapping(expected.as_ptr(), (*a).payload.cast::<u8>(), FIRST);
+                std::ptr::copy_nonoverlapping(
+                    expected.as_ptr().add(FIRST),
+                    (*b).payload.cast::<u8>(),
+                    SECOND,
+                );
+                pbuf_cat(a, b);
+                let ctx_ptr = std::ptr::from_ref(&stream.callback_ctx)
+                    .cast_mut()
+                    .cast::<raw::c_void>();
+                tcp_recv_cb(ctx_ptr, pcb, a, err_enum_t_ERR_OK as err_t);
+            }
+        }
+
+        let (_, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut delivered = Vec::new();
+        // 700 divides into neither node length: reads land mid-node, at the
+        // node boundary's far side, and across the final tail.
+        let mut scratch = [0u8; 700];
+        loop {
+            let mut read_buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut *stream).poll_read(&mut cx, &mut read_buf) {
+                Poll::Ready(Ok(())) if read_buf.filled().is_empty() => break,
+                Poll::Ready(Ok(())) => delivered.extend_from_slice(read_buf.filled()),
+                Poll::Pending => break,
+                other => panic!("unexpected poll result: {other:?}"),
+            }
+            if delivered.len() >= expected.len() {
+                break;
+            }
+        }
+        assert_eq!(delivered.len(), expected.len());
+        assert_eq!(delivered, expected, "handoff must not reorder or corrupt");
+    }
+
+    /// Chains handed to the reader are returned to lwIP on the NEXT poll's
+    /// locked phase, and teardown returns everything still queued — the
+    /// global queued-packet accounting must come back to its baseline.
+    #[test]
+    fn handed_off_chains_are_returned_on_next_poll_and_teardown() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stack_impl::initialize_lwip();
+        let baseline = crate::tcp_stream_context::tcp_runtime_stats();
+
+        let (mut stream, pcb) = {
+            let _guard = LWIP_MUTEX.lock();
+            let pcb = unsafe { fake_established_pcb() };
+            (TcpStreamImpl::new(pcb), pcb)
+        };
+
+        let deliver = |stream: &TcpStreamImpl, bytes: u16| {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe {
+                let p = pbuf_alloc(pbuf_layer_PBUF_RAW, bytes, pbuf_type_PBUF_RAM);
+                assert!(!p.is_null());
+                let ctx_ptr = std::ptr::from_ref(&stream.callback_ctx)
+                    .cast_mut()
+                    .cast::<raw::c_void>();
+                tcp_recv_cb(ctx_ptr, pcb, p, err_enum_t_ERR_OK as err_t);
+            }
+        };
+
+        deliver(&stream, 640);
+        let after_first = crate::tcp_stream_context::tcp_runtime_stats();
+        assert_eq!(after_first.queued_packets, baseline.queued_packets + 1);
+        assert_eq!(after_first.queued_bytes, baseline.queued_bytes + 640);
+
+        let (_, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut scratch = [0u8; 4096];
+        let mut read_buf = ReadBuf::new(&mut scratch);
+        let poll = Pin::new(&mut *stream).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(read_buf.filled().len(), 640);
+        // Fully consumed, but the chain rides in `spent` until the next
+        // locked phase returns it.
+        let mut read_buf = ReadBuf::new(&mut scratch);
+        let _ = Pin::new(&mut *stream).poll_read(&mut cx, &mut read_buf);
+        let after_return = crate::tcp_stream_context::tcp_runtime_stats();
+        assert_eq!(after_return.queued_packets, baseline.queued_packets);
+        assert_eq!(after_return.queued_bytes, baseline.queued_bytes);
+
+        // Teardown with undelivered chains still queued must return them too.
+        deliver(&stream, 512);
+        deliver(&stream, 256);
+        drop(stream);
+        let after_drop = crate::tcp_stream_context::tcp_runtime_stats();
+        assert_eq!(after_drop.queued_packets, baseline.queued_packets);
+        assert_eq!(after_drop.queued_bytes, baseline.queued_bytes);
+        assert_eq!(after_drop.active_streams, baseline.active_streams);
     }
 }

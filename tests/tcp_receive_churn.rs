@@ -495,13 +495,15 @@ fn payload_is_read_before_fin_becomes_sticky_eof() {
                 .expect("payload read failed");
             assert_eq!(payload_read, payload.len());
             assert_eq!(&received[..payload_read], payload);
-            assert_eq!(lwip::tcp_runtime_stats().queued_packets, 0);
-            assert_eq!(lwip::tcp_runtime_stats().queued_bytes, 0);
 
             let first_eof = stream.read(&mut received).await.unwrap();
             let second_eof = stream.read(&mut received).await.unwrap();
             assert_eq!(first_eof, 0);
             assert_eq!(second_eof, 0);
+            // The consumed chain is returned to lwIP during the next poll's
+            // locked phase (the EOF read above), not by the delivering read.
+            assert_eq!(lwip::tcp_runtime_stats().queued_packets, 0);
+            assert_eq!(lwip::tcp_runtime_stats().queued_bytes, 0);
         });
 }
 
@@ -546,6 +548,15 @@ fn one_large_read_drains_all_queued_packets_and_counters() {
                 assert!(segment.iter().all(|byte| *byte == index as u8));
             }
 
+            // Consumed chains ride in the stream until the next poll's
+            // locked phase returns them to lwIP; the read itself must have
+            // claimed everything off the shared queue, and the following
+            // (data-less) poll settles the accounting back to zero.
+            let after_read = lwip::tcp_runtime_stats();
+            assert_eq!(after_read.queued_packets, SEGMENTS);
+            assert_eq!(after_read.queued_bytes, SEGMENTS * SEGMENT_BYTES);
+            let idle_poll = timeout(Duration::from_millis(50), stream.read(&mut received)).await;
+            assert!(idle_poll.is_err(), "no data is left to read");
             let drained = lwip::tcp_runtime_stats();
             assert_eq!(drained.queued_packets, 0);
             assert_eq!(drained.queued_bytes, 0);
