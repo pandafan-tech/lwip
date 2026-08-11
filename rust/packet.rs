@@ -4,6 +4,68 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use super::shard::ShardRef;
+
+/// Payload segments a zero-copy egress frame still owes the buffer. Captured
+/// UNDER the shard lock at output-callback time: lwIP rewrites pbuf node
+/// fields (payload pointer, len) in place when it retransmits a segment, so
+/// the chain must never be re-walked outside the lock — only these raw
+/// (pointer, len) snapshots are read there. The bytes they cover are the
+/// application payload, which lwIP never mutates while the segment lives,
+/// and the chain refcount taken alongside keeps the memory alive until the
+/// lease is returned.
+pub(crate) struct PbufTail {
+    /// The refcounted chain head, returned to the shard's lease rail.
+    chain: *mut super::lwip::pbuf,
+    shard: ShardRef,
+    /// Raw payload extents; the array bound covers any realistic segment
+    /// chain (header node + a few payload nodes).
+    segs: [(*const u8, u32); PBUF_TAIL_MAX_SEGS],
+    seg_count: u8,
+}
+
+pub(crate) const PBUF_TAIL_MAX_SEGS: usize = 4;
+
+impl PbufTail {
+    /// # Safety
+    /// `chain` must hold a refcount owned by this tail; every `(ptr, len)`
+    /// in `segs[..seg_count]` must point at payload bytes kept alive by
+    /// that refcount and never mutated by lwIP.
+    pub(crate) unsafe fn new(
+        chain: *mut super::lwip::pbuf,
+        shard: ShardRef,
+        segs: [(*const u8, u32); PBUF_TAIL_MAX_SEGS],
+        seg_count: u8,
+    ) -> Self {
+        Self {
+            chain,
+            shard,
+            segs,
+            seg_count,
+        }
+    }
+}
+
+// SAFETY: the tail is an exclusively-owned lease; the raw pointers are only
+// read (finalize) or handed to the lease rail (drop), never shared.
+unsafe impl Send for PbufTail {}
+unsafe impl Sync for PbufTail {}
+
+impl PbufTail {
+    /// Disarm the parking Drop and surrender the chain — for the one caller
+    /// that already holds the shard lock and can free immediately.
+    pub(crate) fn into_chain(self) -> *mut super::lwip::pbuf {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.chain
+    }
+}
+
+impl Drop for PbufTail {
+    fn drop(&mut self) {
+        self.shard.park_pbuf_lease(self.chain);
+    }
+}
+
 fn packet_pool_registry() -> &'static Mutex<Vec<Weak<PacketPool>>> {
     static REGISTRY: OnceLock<Mutex<Vec<Weak<PacketPool>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
@@ -119,6 +181,7 @@ impl PacketPool {
         IpPacket {
             buffer: Some(buffer),
             pool: Some(Arc::clone(self)),
+            tail: None,
         }
     }
 
@@ -160,6 +223,10 @@ impl PacketPool {
 pub struct IpPacket {
     buffer: Option<Vec<u8>>,
     pool: Option<Arc<PacketPool>>,
+    /// Zero-copy egress: payload bytes still owed by a leased pbuf chain.
+    /// `finalize` (called at the egress channel exit, off the shard lock)
+    /// appends them and returns the lease; until then `deref` must not run.
+    tail: Option<PbufTail>,
 }
 
 impl IpPacket {
@@ -185,6 +252,47 @@ impl IpPacket {
     pub fn is_empty(&self) -> bool {
         self.deref().is_empty()
     }
+
+    /// Attach the payload a zero-copy egress frame still owes. The buffer
+    /// holds only the header snapshot; capacity for the payload was
+    /// reserved by `acquire`.
+    pub(crate) fn set_tail(&mut self, tail: PbufTail) {
+        debug_assert!(self.tail.is_none());
+        self.tail = Some(tail);
+    }
+
+    /// Backpressure path: the output callback still holds the shard lock
+    /// when a send is refused, so the lease is returned through `free`
+    /// right now instead of riding the rail to a later tenure.
+    pub(crate) fn drop_tail_for_immediate_free(
+        &mut self,
+        free: impl FnOnce(*mut super::lwip::pbuf),
+    ) {
+        if let Some(tail) = self.tail.take() {
+            free(tail.into_chain());
+        }
+    }
+
+    /// Materialize the payload of a zero-copy frame and return its lease.
+    /// Runs at the egress channel exit — on the consumer's task, never
+    /// under the shard lock — so the memcpy this replaces no longer spends
+    /// lock tenure. Idempotent; owned frames are untouched.
+    pub(crate) fn finalize(&mut self) {
+        let Some(tail) = self.tail.take() else {
+            return;
+        };
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("packet buffer already released");
+        for (ptr, len) in tail.segs.iter().take(usize::from(tail.seg_count)) {
+            // SAFETY: PbufTail::new's contract — the extent is alive under
+            // the chain refcount and immutable.
+            let bytes = unsafe { std::slice::from_raw_parts(*ptr, *len as usize) };
+            buffer.extend_from_slice(bytes);
+        }
+        // `tail` drops here, parking the chain on the shard's lease rail.
+    }
 }
 
 impl From<Vec<u8>> for IpPacket {
@@ -192,6 +300,7 @@ impl From<Vec<u8>> for IpPacket {
         Self {
             buffer: Some(buffer),
             pool: None,
+            tail: None,
         }
     }
 }
@@ -206,6 +315,10 @@ impl Deref for IpPacket {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
+        debug_assert!(
+            self.tail.is_none(),
+            "zero-copy egress frame dereferenced before finalize"
+        );
         self.buffer
             .as_deref()
             .expect("packet buffer already released")

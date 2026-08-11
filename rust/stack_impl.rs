@@ -128,6 +128,9 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
 
 pub(crate) fn initialize_lwip(shard: ShardRef) {
     super::mutex::lock_stats::init_from_env();
+    if std::env::var_os("PANDA_LWIP_ZEROCOPY_EGRESS").is_some() {
+        super::output::ZEROCOPY_EGRESS.store(true, Ordering::Relaxed);
+    }
     let _guard = shard.mutex.lock();
     initialize_windows_runtime_config().unwrap_or_else(|error| panic!("{error}"));
     shard.init.call_once(|| unsafe {
@@ -298,6 +301,7 @@ impl NetStackImpl {
             loop {
                 {
                     let _g = shard.mutex.lock_at(lock_stats::SITE_TIMER);
+                    shard.drain_pbuf_leases(&_g);
                     unsafe { (shard.vt.sys_check_timeouts)() };
                     // Timer processing frees pool capacity with no per-pcb
                     // callback (FIN_WAIT/TIME_WAIT reaps, retransmit
@@ -347,6 +351,10 @@ impl NetStackImpl {
         self.tx.downgrade()
     }
 
+    // The Err variant intentionally carries the whole frame back: the
+    // zero-copy backpressure path must reclaim the lease while the output
+    // callback still holds the shard lock.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn output(&mut self, pkt: IpPacket) -> Result<(), TrySendError<IpPacket>> {
         // tokio's mpsc wakes the receiver on try_send; no manual waker is
         // needed, so egress consumers never have to touch LWIP_MUTEX.
@@ -372,6 +380,7 @@ impl NetStackImpl {
             .shard
             .mutex
             .lock_at(super::mutex::lock_stats::SITE_INPUT);
+        self.shard.drain_pbuf_leases(&guard);
         for item in items {
             if item.is_empty() {
                 continue;
@@ -400,6 +409,7 @@ impl Drop for NetStackImpl {
         self.timeout_task.abort();
         {
             let _g = self.shard.mutex.lock();
+            self.shard.drain_pbuf_leases(&_g);
             // Only clear the output hook if it still points at us. If a
             // successor stack was created before this one finished tearing
             // down (a stop/start race in the consumer), unconditionally
@@ -425,7 +435,10 @@ impl Stream for NetStackImpl {
             .as_mut()
             .expect("netstack egress receiver already taken");
         let result = match rx.poll_recv(cx) {
-            Poll::Ready(Some(pkt)) => Poll::Ready(Some(Ok(pkt))),
+            Poll::Ready(Some(mut pkt)) => {
+                pkt.finalize();
+                Poll::Ready(Some(Ok(pkt)))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         };

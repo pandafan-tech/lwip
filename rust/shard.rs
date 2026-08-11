@@ -48,6 +48,7 @@ macro_rules! with_shard_api {
                 fn(pbuf_layer, u16_t, pbuf_type, *mut pbuf_custom, *mut ::std::os::raw::c_void, u16_t) -> *mut pbuf,
             pbuf_alloc_reference: fn(*mut ::std::os::raw::c_void, u16_t, pbuf_type) -> *mut pbuf,
             pbuf_free: fn(*mut pbuf) -> u8_t,
+            pbuf_ref: fn(*mut pbuf),
             pbuf_copy_partial: fn(*const pbuf, *mut ::std::os::raw::c_void, u16_t, u16_t) -> u16_t,
             tcp_new: fn() -> *mut tcp_pcb,
             tcp_bind: fn(*mut tcp_pcb, *const ip_addr_t, u16_t) -> err_t,
@@ -150,11 +151,38 @@ pub(crate) struct ShardState {
     pub active_tcp_streams: std::sync::atomic::AtomicUsize,
     pub tcp_queued_packets: std::sync::atomic::AtomicUsize,
     pub tcp_queued_bytes: std::sync::atomic::AtomicUsize,
+    /// Zero-copy egress lease returns. `pbuf_free` may only run under this
+    /// shard's lwIP mutex, but leased frames are finalized (and dropped) on
+    /// writer tasks that never hold it — they park the chain pointer here
+    /// and the next locked tenure (ingress batch, timer tick, teardown)
+    /// frees the backlog. Bounded by the egress channel depth.
+    pub pbuf_leases: std::sync::Mutex<Vec<*mut pbuf>>,
 }
 
-// SAFETY: raw-pointer-holding fields (mem_pressure) are only touched under
-// this shard's mutex; the rest are atomics/Once.
+// SAFETY: raw-pointer-holding fields are only dereferenced under this
+// shard's mutex (mem_pressure) or freed under it (pbuf_leases — its own
+// std Mutex only serializes the pointer handoff); the rest are
+// atomics/Once.
 unsafe impl Sync for ShardState {}
+
+impl ShardState {
+    /// Park a leased pbuf chain for the next locked tenure to free. Called
+    /// from writer tasks and packet Drops that do not hold the lwIP mutex.
+    pub(crate) fn park_pbuf_lease(&self, chain: *mut pbuf) {
+        self.pbuf_leases
+            .lock()
+            .expect("pbuf lease rail poisoned")
+            .push(chain);
+    }
+
+    /// Free every parked lease; the guard witnesses the lwIP mutex.
+    pub(crate) fn drain_pbuf_leases(&self, _guard: &super::LWIPMutexGuard) {
+        let mut rail = self.pbuf_leases.lock().expect("pbuf lease rail poisoned");
+        for chain in rail.drain(..) {
+            unsafe { (self.vt.pbuf_free)(chain) };
+        }
+    }
+}
 
 pub(crate) type ShardRef = &'static ShardState;
 
@@ -177,6 +205,7 @@ macro_rules! shard_state {
             active_tcp_streams: AtomicUsize::new(0),
             tcp_queued_packets: AtomicUsize::new(0),
             tcp_queued_bytes: AtomicUsize::new(0),
+            pbuf_leases: std::sync::Mutex::new(Vec::new()),
         }
     };
 }

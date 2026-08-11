@@ -102,8 +102,12 @@ pub struct StackEgress(Receiver<IpPacket>, shard::ShardRef);
 
 impl StackEgress {
     pub async fn recv(&mut self) -> Option<IpPacket> {
-        let packet = self.0.recv().await;
-        if packet.is_some() {
+        let mut packet = self.0.recv().await;
+        if let Some(packet) = packet.as_mut() {
+            // Materialize a zero-copy frame here, on the consumer's task —
+            // this memcpy is exactly the one the output callback no longer
+            // spends shard-lock tenure on.
+            packet.finalize();
             retry_backpressured_tcp_output(self.1);
         }
         packet
@@ -112,7 +116,11 @@ impl StackEgress {
     /// Receive up to `limit` packets in one call, awaiting until at least one
     /// is available. Returns the number received (0 = channel closed).
     pub async fn recv_many(&mut self, buffer: &mut Vec<IpPacket>, limit: usize) -> usize {
+        let received_from = buffer.len();
         let count = self.0.recv_many(buffer, limit).await;
+        for packet in &mut buffer[received_from..] {
+            packet.finalize();
+        }
         if count > 0 {
             retry_backpressured_tcp_output(self.1);
         }
