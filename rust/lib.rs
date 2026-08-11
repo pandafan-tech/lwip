@@ -5,6 +5,7 @@ mod mutex;
 mod output;
 mod packet;
 mod pbuf_pool;
+mod shard;
 mod stack;
 mod stack_impl;
 mod tcp_listener;
@@ -15,13 +16,19 @@ mod tcp_stream_impl;
 mod udp;
 mod util;
 
+// The primary (shard 0) stack's lock. Shards 1.. carry their own mutex in
+// `shard::SHARDS`; this static stays for the many shard-0 lock sites.
 pub(crate) static LWIP_MUTEX: mutex::AtomicMutex = mutex::AtomicMutex::new();
 pub(crate) use mutex::AtomicMutexGuard as LWIPMutexGuard;
 
 pub use packet::{
     packet_pool_runtime_stats, trim_packet_pools, IpPacket, PacketPool, PacketPoolsRuntimeStats,
 };
-pub use pbuf_pool::{configure_pbuf_pool_capacity, pbuf_pool_runtime_stats, PbufPoolRuntimeStats};
+pub use pbuf_pool::{
+    configure_pbuf_pool_capacity, pbuf_pool_runtime_stats, pbuf_pool_runtime_stats_sharded,
+    PbufPoolRuntimeStats,
+};
+pub use shard::shard_count;
 pub use stack::{NetStack, StackEgress, StackIngress};
 pub use stack_impl::{initialize_windows_runtime_config, set_tcp_tx_partial_checksum};
 pub use tcp_listener::TcpListener;

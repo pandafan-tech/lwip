@@ -12,9 +12,9 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub(crate) fn new() -> Result<Self, Error> {
+    pub(crate) fn new(shard: crate::shard::ShardRef) -> Result<Self, Error> {
         Ok(TcpListener {
-            inner: TcpListenerImpl::new()?,
+            inner: TcpListenerImpl::new(shard)?,
         })
     }
 }

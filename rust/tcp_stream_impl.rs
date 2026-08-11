@@ -5,12 +5,12 @@ use log::*;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::lwip::*;
+use super::shard::ShardRef;
 use super::tcp_stream_context::{
     pressure_park_locked, pressure_remove_locked, pressure_unpark_all_locked,
     pressure_unpark_one_locked, ActiveTcpStream, QueuedPbuf, TcpStreamContext,
 };
 use super::util;
-use super::LWIP_MUTEX;
 
 #[allow(unused_variables)]
 pub unsafe extern "C" fn tcp_recv_cb(
@@ -27,6 +27,7 @@ pub unsafe extern "C" fn tcp_recv_cb(
     // SAFETY: tcp_recv_cb is called from tcp_input or sys_check_timeouts only when
     // a data packet or previously refused data is received. Thus lwip_mutex must be locked.
     // See also `<NetStackImpl as AsyncWrite>::poll_write`.
+    let shard = (*(arg as *const TcpStreamContext)).shard();
     let ctx = &mut *TcpStreamContext::assume_locked(arg as *const TcpStreamContext);
 
     if p.is_null() {
@@ -44,9 +45,9 @@ pub unsafe extern "C" fn tcp_recv_cb(
     // ownership of `p` to this callback; the reader returns it via
     // free_locked in a later locked phase.
     if std::ptr::read_unaligned(p).tot_len == 0 {
-        // tcp_recv_cb runs under LWIP_MUTEX (called from tcp_input), so the
-        // immediate free is already serialized.
-        pbuf_free(p);
+        // tcp_recv_cb runs under the shard's mutex (called from tcp_input),
+        // so the immediate free is already serialized.
+        (shard.vt.pbuf_free)(p);
         return err_enum_t_ERR_OK as err_t;
     }
     ctx.read_queue.push_back(QueuedPbuf::new(p));
@@ -62,6 +63,7 @@ pub extern "C" fn tcp_sent_cb(arg: *mut raw::c_void, tpcb: *mut tcp_pcb, len: u1
     // SAFETY: tcp_sent_cb is called from tcp_input only when
     // an ACK packet is received. Thus lwip_mutex must be locked.
     // See also `<NetStackImpl as AsyncWrite>::poll_write`.
+    let shard = unsafe { (*(arg as *const TcpStreamContext)).shard() };
     {
         let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
         // trace!("netstack tcp sent {}", &ctx.local_addr);
@@ -72,7 +74,7 @@ pub extern "C" fn tcp_sent_cb(arg: *mut raw::c_void, tpcb: *mut tcp_pcb, len: u1
     // tcp_input freed this ACK's segments (and their payload memory) before
     // invoking us; hand the capacity to a writer parked on pool exhaustion.
     // The own-context borrow is dropped above: unpark walks foreign contexts.
-    unsafe { pressure_unpark_one_locked() };
+    unsafe { pressure_unpark_one_locked(shard) };
     err_enum_t_ERR_OK as err_t
 }
 
@@ -81,13 +83,14 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     // SAFETY: tcp_err_cb is called from
     // tcp_input, tcp_abandon, tcp_abort, tcp_alloc and tcp_new.
     // Thus lwip_mutex must be locked before calling any of these.
+    let shard = unsafe { (*(arg as *const TcpStreamContext)).shard() };
     {
         let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
         trace!("netstack tcp err {} {}", err, ctx.local_addr);
         ctx.errored = true;
         // An errored stream is done writing; a stale pressure entry must not
         // swallow an unpark meant for a live writer.
-        unsafe { pressure_remove_locked(arg as *const TcpStreamContext, &mut ctx) };
+        unsafe { pressure_remove_locked(shard, arg as *const TcpStreamContext, &mut ctx) };
         if let Some(waker) = ctx.read_waker.take() {
             waker.wake();
         }
@@ -97,7 +100,7 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     }
     // lwIP freed the pcb and everything it had queued before invoking us;
     // that bulk capacity can unblock every parked writer.
-    unsafe { pressure_unpark_all_locked() };
+    unsafe { pressure_unpark_all_locked(shard) };
 }
 
 #[allow(unused_variables)]
@@ -124,6 +127,7 @@ unsafe impl Send for PbufCursor {}
 unsafe impl Sync for PbufCursor {}
 
 pub struct TcpStreamImpl {
+    shard: ShardRef,
     src_addr: SocketAddr,
     dest_addr: SocketAddr,
     pcb: usize,
@@ -148,18 +152,18 @@ pub struct TcpStreamImpl {
 }
 
 impl TcpStreamImpl {
-    pub fn new(pcb: *mut tcp_pcb) -> Box<Self> {
+    pub fn new(pcb: *mut tcp_pcb, shard: ShardRef) -> Box<Self> {
         unsafe {
             // The receive callback and AsyncRead consumer both run under
-            // LWIP_MUTEX, so a direct queue avoids the redundant atomics and
-            // per-packet wake path of a thread-safe channel. lwIP owns flow
-            // control: we only call tcp_recved after the Rust consumer has
-            // actually copied bytes out of this queue.
+            // the shard's mutex, so a direct queue avoids the redundant
+            // atomics and per-packet wake path of a thread-safe channel.
+            // lwIP owns flow control: we only call tcp_recved after the Rust
+            // consumer has actually copied bytes out of this queue.
             let mut remote_ip = std::mem::zeroed();
             let mut remote_port = 0;
             let mut local_ip = std::mem::zeroed();
             let mut local_port = 0;
-            lwip_rs_tcp_endpoints(
+            (shard.vt.lwip_rs_tcp_endpoints)(
                 pcb,
                 &mut remote_ip,
                 &mut remote_port,
@@ -169,6 +173,7 @@ impl TcpStreamImpl {
             let src_addr = util::to_socket_addr(&remote_ip, remote_port);
             let dest_addr = util::to_socket_addr(&local_ip, local_port);
             let stream = Box::new(TcpStreamImpl {
+                shard,
                 src_addr,
                 dest_addr,
                 pcb: pcb as usize,
@@ -176,15 +181,15 @@ impl TcpStreamImpl {
                 staged: std::collections::VecDeque::new(),
                 spent: Vec::new(),
                 pending_recved: 0,
-                callback_ctx: TcpStreamContext::new(src_addr),
+                callback_ctx: TcpStreamContext::new(src_addr, shard),
                 _active: ActiveTcpStream::new(),
             });
             let arg = &stream.callback_ctx as *const _;
-            tcp_arg(pcb, arg as *mut raw::c_void);
-            tcp_recv(pcb, Some(tcp_recv_cb));
-            tcp_sent(pcb, Some(tcp_sent_cb));
-            tcp_err(pcb, Some(tcp_err_cb));
-            tcp_poll(pcb, Some(tcp_poll_cb), 8 as _);
+            (shard.vt.tcp_arg)(pcb, arg as *mut raw::c_void);
+            (shard.vt.tcp_recv)(pcb, Some(tcp_recv_cb));
+            (shard.vt.tcp_sent)(pcb, Some(tcp_sent_cb));
+            (shard.vt.tcp_err)(pcb, Some(tcp_err_cb));
+            (shard.vt.tcp_poll)(pcb, Some(tcp_poll_cb), 8 as _);
             stream.apply_pcb_opts();
             trace!("netstack tcp new {}", stream.local_addr());
             stream
@@ -193,7 +198,10 @@ impl TcpStreamImpl {
 
     fn apply_pcb_opts(&self) {
         unsafe {
-            lwip_rs_tcp_apply_options(self.pcb as *mut tcp_pcb, cfg!(target_os = "ios") as i32);
+            (self.shard.vt.lwip_rs_tcp_apply_options)(
+                self.pcb as *mut tcp_pcb,
+                cfg!(target_os = "ios") as i32,
+            );
         }
     }
 
@@ -206,7 +214,7 @@ impl TcpStreamImpl {
     }
 
     fn send_buf_size(&self) -> usize {
-        unsafe { lwip_rs_tcp_send_buffer(self.pcb as *const tcp_pcb) as usize }
+        unsafe { (self.shard.vt.lwip_rs_tcp_send_buffer)(self.pcb as *const tcp_pcb) as usize }
     }
 }
 
@@ -233,9 +241,10 @@ impl AsyncRead for TcpStreamImpl {
         // control lwIP should see.
         let read_eof;
         {
-            let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_READ);
+            let shard = me.shard;
+            let guard = shard.mutex.lock_at(super::mutex::lock_stats::SITE_READ);
             for chain in me.spent.drain(..) {
-                chain.free_locked(&guard);
+                chain.free_locked(shard, &guard);
             }
             let ctx = &mut *me.callback_ctx.with_lock(&guard);
             if ctx.errored {
@@ -244,7 +253,7 @@ impl AsyncRead for TcpStreamImpl {
             while me.pending_recved > 0 {
                 let acknowledged = me.pending_recved.min(usize::from(u16::MAX));
                 unsafe {
-                    tcp_recved(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
+                    (shard.vt.tcp_recved)(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
                 }
                 me.pending_recved -= acknowledged;
             }
@@ -330,39 +339,40 @@ impl AsyncRead for TcpStreamImpl {
 
 impl Drop for TcpStreamImpl {
     fn drop(&mut self) {
-        let guard = LWIP_MUTEX.lock();
+        let shard = self.shard;
+        let guard = shard.mutex.lock();
         // Return every pbuf chain this stream still owns while the lock is
         // held: undelivered (staged), mid-copy (read_buf), consumed-but-not-
         // yet-returned (spent), and never-claimed (ctx.read_queue below).
         for chain in self.staged.drain(..) {
-            chain.free_locked(&guard);
+            chain.free_locked(shard, &guard);
         }
         if let Some(cursor) = self.read_buf.take() {
-            cursor.chain.free_locked(&guard);
+            cursor.chain.free_locked(shard, &guard);
         }
         for chain in self.spent.drain(..) {
-            chain.free_locked(&guard);
+            chain.free_locked(shard, &guard);
         }
         {
             let mut ctx = self.callback_ctx.with_lock(&guard);
             trace!("netstack tcp drop {}", ctx.local_addr);
             for chain in ctx.read_queue.drain(..) {
-                chain.free_locked(&guard);
+                chain.free_locked(shard, &guard);
             }
             // The context is about to be freed with the stream; it must leave
             // the pressure queue while the pointer is still valid.
             unsafe {
-                pressure_remove_locked(&self.callback_ctx as *const _, &mut ctx);
+                pressure_remove_locked(shard, &self.callback_ctx as *const _, &mut ctx);
             }
             if !ctx.errored {
                 unsafe {
-                    tcp_arg(self.pcb as *mut tcp_pcb, std::ptr::null_mut());
-                    tcp_recv(self.pcb as *mut tcp_pcb, None);
-                    tcp_sent(self.pcb as *mut tcp_pcb, None);
-                    tcp_err(self.pcb as *mut tcp_pcb, None);
-                    tcp_poll(self.pcb as *mut tcp_pcb, None, 0);
+                    (shard.vt.tcp_arg)(self.pcb as *mut tcp_pcb, std::ptr::null_mut());
+                    (shard.vt.tcp_recv)(self.pcb as *mut tcp_pcb, None);
+                    (shard.vt.tcp_sent)(self.pcb as *mut tcp_pcb, None);
+                    (shard.vt.tcp_err)(self.pcb as *mut tcp_pcb, None);
+                    (shard.vt.tcp_poll)(self.pcb as *mut tcp_pcb, None, 0);
                     if !ctx.closed {
-                        tcp_abort(self.pcb as *mut tcp_pcb);
+                        (shard.vt.tcp_abort)(self.pcb as *mut tcp_pcb);
                     } else {
                         // poll_shutdown already half-closed TX (tcp_shutdown
                         // rx=0 tx=1), so the pcb is in FIN_WAIT_1/2 awaiting
@@ -374,8 +384,10 @@ impl Drop for TcpStreamImpl {
                         // enabling the TCP_FIN_WAIT_TIMEOUT (20 s) reap; it
                         // frees nothing we still reference. Fall back to abort
                         // if it errors.
-                        if tcp_close(self.pcb as *mut tcp_pcb) != err_enum_t_ERR_OK as err_t {
-                            tcp_abort(self.pcb as *mut tcp_pcb);
+                        if (shard.vt.tcp_close)(self.pcb as *mut tcp_pcb)
+                            != err_enum_t_ERR_OK as err_t
+                        {
+                            (shard.vt.tcp_abort)(self.pcb as *mut tcp_pcb);
                         }
                     }
                 }
@@ -384,13 +396,14 @@ impl Drop for TcpStreamImpl {
         // The abort above returned the pcb's queued segments and payload
         // memory to the shared pools; that bulk capacity can unblock every
         // parked writer. The own-context borrow ended with the scope.
-        unsafe { pressure_unpark_all_locked() };
+        unsafe { pressure_unpark_all_locked(shard) };
     }
 }
 
 impl AsyncWrite for TcpStreamImpl {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_WRITE);
+        let shard = self.shard;
+        let guard = shard.mutex.lock_at(super::mutex::lock_stats::SITE_WRITE);
         let ctx = &mut *self.callback_ctx.with_lock(&guard);
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
@@ -406,7 +419,7 @@ impl AsyncWrite for TcpStreamImpl {
             return Poll::Pending;
         }
         let err = unsafe {
-            tcp_write(
+            (shard.vt.tcp_write)(
                 self.pcb as *mut tcp_pcb,
                 buf.as_ptr() as *const raw::c_void,
                 to_write as u16_t,
@@ -414,7 +427,7 @@ impl AsyncWrite for TcpStreamImpl {
             )
         };
         if err == err_enum_t_ERR_OK as err_t {
-            let output_err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
+            let output_err = unsafe { (shard.vt.tcp_output)(self.pcb as *mut tcp_pcb) };
             if output_err != err_enum_t_ERR_OK as err_t {
                 // tcp_write already accepted these bytes into lwIP's unsent
                 // queue. Reporting an error would make AsyncWrite callers
@@ -431,7 +444,7 @@ impl AsyncWrite for TcpStreamImpl {
             // Park on the global pressure queue so freed capacity wakes this
             // writer instead of leaving it to the 4-second tcp_poll fallback.
             ctx.write_waker.replace(cx.waker().clone());
-            unsafe { pressure_park_locked(&self.callback_ctx as *const _, ctx) };
+            unsafe { pressure_park_locked(shard, &self.callback_ctx as *const _, ctx) };
             Poll::Pending
         } else {
             Poll::Ready(Err(io::Error::new(
@@ -442,11 +455,14 @@ impl AsyncWrite for TcpStreamImpl {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_FLUSH);
+        let guard = self
+            .shard
+            .mutex
+            .lock_at(super::mutex::lock_stats::SITE_FLUSH);
         if self.callback_ctx.with_lock(&guard).errored {
             return Poll::Ready(Err(broken_pipe()));
         }
-        let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
+        let err = unsafe { (self.shard.vt.tcp_output)(self.pcb as *mut tcp_pcb) };
         if err != err_enum_t_ERR_OK as err_t {
             // Transmission deferrals, not stream errors: pool exhaustion,
             // egress-channel backpressure (the netif output hook returns
@@ -462,13 +478,13 @@ impl AsyncWrite for TcpStreamImpl {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        let guard = LWIP_MUTEX.lock();
+        let guard = self.shard.mutex.lock();
         let ctx = &mut *self.callback_ctx.with_lock(&guard);
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
         }
         trace!("netstack tcp shutdown {}", ctx.local_addr);
-        let err = unsafe { tcp_shutdown(self.pcb as *mut tcp_pcb, 0, 1) };
+        let err = unsafe { (self.shard.vt.tcp_shutdown)(self.pcb as *mut tcp_pcb, 0, 1) };
         if err != err_enum_t_ERR_OK as err_t {
             Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -484,7 +500,9 @@ impl AsyncWrite for TcpStreamImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::primary;
     use crate::stack_impl::LWIP_TEST_LOCK;
+    use crate::LWIP_MUTEX;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::{Wake, Waker};
@@ -565,12 +583,12 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::stack_impl::initialize_lwip();
+        crate::stack_impl::initialize_lwip(primary());
 
         let mut hoard = SegPoolHoard::exhaust();
         let mut victim = {
             let _guard = LWIP_MUTEX.lock();
-            unsafe { TcpStreamImpl::new(fake_established_pcb()) }
+            unsafe { TcpStreamImpl::new(fake_established_pcb(), primary()) }
         };
 
         let (victim_wakes, waker) = counting_waker();
@@ -585,7 +603,7 @@ mod tests {
         // and its sent callback fires — exactly what tcp_input does after
         // freeing acked segments.
         hoard.release_one();
-        let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap());
+        let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap(), primary());
         {
             let _guard = LWIP_MUTEX.lock();
             let foreign_ptr = std::ptr::from_ref(&foreign_ctx).cast_mut().cast();
@@ -607,12 +625,12 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::stack_impl::initialize_lwip();
+        crate::stack_impl::initialize_lwip(primary());
 
         let _hoard = SegPoolHoard::exhaust();
         let mut victim = {
             let _guard = LWIP_MUTEX.lock();
-            unsafe { TcpStreamImpl::new(fake_established_pcb()) }
+            unsafe { TcpStreamImpl::new(fake_established_pcb(), primary()) }
         };
 
         let (_victim_wakes, waker) = counting_waker();
@@ -622,7 +640,7 @@ mod tests {
         {
             let _guard = LWIP_MUTEX.lock();
             assert_eq!(
-                unsafe { crate::tcp_stream_context::pressure_queue_len_locked() },
+                unsafe { crate::tcp_stream_context::pressure_queue_len_locked(primary()) },
                 1
             );
         }
@@ -631,12 +649,12 @@ mod tests {
         {
             let _guard = LWIP_MUTEX.lock();
             assert_eq!(
-                unsafe { crate::tcp_stream_context::pressure_queue_len_locked() },
+                unsafe { crate::tcp_stream_context::pressure_queue_len_locked(primary()) },
                 0
             );
         }
 
-        let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap());
+        let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap(), primary());
         {
             let _guard = LWIP_MUTEX.lock();
             let foreign_ptr = std::ptr::from_ref(&foreign_ctx).cast_mut().cast();
@@ -653,7 +671,7 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::stack_impl::initialize_lwip();
+        crate::stack_impl::initialize_lwip(primary());
 
         struct NetifListRestore(*mut netif);
         impl Drop for NetifListRestore {
@@ -665,7 +683,7 @@ mod tests {
 
         let mut stream = {
             let _guard = LWIP_MUTEX.lock();
-            unsafe { TcpStreamImpl::new(fake_established_pcb()) }
+            unsafe { TcpStreamImpl::new(fake_established_pcb(), primary()) }
         };
 
         let (_, waker) = counting_waker();
@@ -692,7 +710,7 @@ mod tests {
 
     #[test]
     fn tcp_sent_consumes_the_registered_write_waker() {
-        let context = TcpStreamContext::new("127.0.0.1:1234".parse().unwrap());
+        let context = TcpStreamContext::new("127.0.0.1:1234".parse().unwrap(), primary());
         let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         {
             let guard = LWIP_MUTEX.lock();
@@ -718,12 +736,12 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::stack_impl::initialize_lwip();
+        crate::stack_impl::initialize_lwip(primary());
 
         let (mut stream, pcb) = {
             let _guard = LWIP_MUTEX.lock();
             let pcb = unsafe { fake_established_pcb() };
-            (TcpStreamImpl::new(pcb), pcb)
+            (TcpStreamImpl::new(pcb, primary()), pcb)
         };
 
         let wnd_start = {
@@ -781,12 +799,12 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::stack_impl::initialize_lwip();
+        crate::stack_impl::initialize_lwip(primary());
 
         let (mut stream, pcb) = {
             let _guard = LWIP_MUTEX.lock();
             let pcb = unsafe { fake_established_pcb() };
-            (TcpStreamImpl::new(pcb), pcb)
+            (TcpStreamImpl::new(pcb, primary()), pcb)
         };
 
         const FIRST: usize = 1100;
@@ -845,13 +863,13 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::stack_impl::initialize_lwip();
+        crate::stack_impl::initialize_lwip(primary());
         let baseline = crate::tcp_stream_context::tcp_runtime_stats();
 
         let (mut stream, pcb) = {
             let _guard = LWIP_MUTEX.lock();
             let pcb = unsafe { fake_established_pcb() };
-            (TcpStreamImpl::new(pcb), pcb)
+            (TcpStreamImpl::new(pcb, primary()), pcb)
         };
 
         let deliver = |stream: &TcpStreamImpl, bytes: u16| {

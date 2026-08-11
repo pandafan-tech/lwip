@@ -5,6 +5,7 @@ use futures::stream::Stream;
 use futures::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
 
+use super::shard;
 use super::stack_impl::{retry_backpressured_tcp_output, NetStackImpl, DEFAULT_MTU};
 use super::tcp_listener::TcpListener;
 use super::udp::UdpSocket;
@@ -14,18 +15,19 @@ pub struct NetStack(Box<NetStackImpl>);
 
 impl NetStack {
     pub fn new() -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        let stack = NetStackImpl::new(512);
-        let udp = UdpSocket::new(64, stack.egress_sender(), DEFAULT_MTU)?;
-        Ok((NetStack(stack), TcpListener::new()?, udp))
+        Self::build(shard::primary(), 512, 64, DEFAULT_MTU)
     }
 
     pub fn with_buffer_size(
         stack_buffer_size: usize,
         udp_buffer_size: usize,
     ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        let stack = NetStackImpl::new(stack_buffer_size);
-        let udp = UdpSocket::new(udp_buffer_size, stack.egress_sender(), DEFAULT_MTU)?;
-        Ok((NetStack(stack), TcpListener::new()?, udp))
+        Self::build(
+            shard::primary(),
+            stack_buffer_size,
+            udp_buffer_size,
+            DEFAULT_MTU,
+        )
     }
 
     pub fn with_buffer_size_and_mtu(
@@ -33,9 +35,39 @@ impl NetStack {
         udp_buffer_size: usize,
         mtu: u16,
     ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        let stack = NetStackImpl::new_with_mtu(stack_buffer_size, mtu);
-        let udp = UdpSocket::new(udp_buffer_size, stack.egress_sender(), mtu)?;
-        Ok((NetStack(stack), TcpListener::new()?, udp))
+        Self::build(shard::primary(), stack_buffer_size, udp_buffer_size, mtu)
+    }
+
+    /// A complete, independent stack instance on the given shard (0 =
+    /// primary; ids up to [`crate::shard_count`]` - 1` address the extra
+    /// symbol-prefixed copies of lwIP). Stacks on different shards share no
+    /// state — no lock, no pools, no pcb lists — so they run fully in
+    /// parallel; the caller owns steering each flow's packets to the shard
+    /// that carries it.
+    pub fn new_sharded(
+        shard_id: usize,
+        stack_buffer_size: usize,
+        udp_buffer_size: usize,
+        mtu: u16,
+    ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
+        let shard = shard::get(shard_id).ok_or_else(|| {
+            Error::RuntimeConfig(format!(
+                "shard {shard_id} out of range; this build carries {} stacks",
+                shard::shard_count()
+            ))
+        })?;
+        Self::build(shard, stack_buffer_size, udp_buffer_size, mtu)
+    }
+
+    fn build(
+        shard: shard::ShardRef,
+        stack_buffer_size: usize,
+        udp_buffer_size: usize,
+        mtu: u16,
+    ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
+        let stack = NetStackImpl::new_with_mtu(stack_buffer_size, mtu, shard);
+        let udp = UdpSocket::new(udp_buffer_size, stack.egress_sender(), mtu, shard)?;
+        Ok((NetStack(stack), TcpListener::new(shard)?, udp))
     }
 
     /// Split into an ingress half (batch input into lwIP) and an egress half
@@ -43,8 +75,9 @@ impl NetStack {
     /// driven from different tasks so TUN read and TUN write directions no
     /// longer serialize on one driver task.
     pub fn split(mut self) -> (StackIngress, StackEgress) {
+        let shard = self.0.shard;
         let rx = self.0.take_egress();
-        (StackIngress(self.0), StackEgress(rx))
+        (StackIngress(self.0), StackEgress(rx, shard))
     }
 }
 
@@ -65,13 +98,13 @@ impl StackIngress {
 
 /// Egress half: packets leaving lwIP toward the TUN device. Ends (returns
 /// `None`) after the ingress half is dropped.
-pub struct StackEgress(Receiver<IpPacket>);
+pub struct StackEgress(Receiver<IpPacket>, shard::ShardRef);
 
 impl StackEgress {
     pub async fn recv(&mut self) -> Option<IpPacket> {
         let packet = self.0.recv().await;
         if packet.is_some() {
-            retry_backpressured_tcp_output();
+            retry_backpressured_tcp_output(self.1);
         }
         packet
     }
@@ -81,7 +114,7 @@ impl StackEgress {
     pub async fn recv_many(&mut self, buffer: &mut Vec<IpPacket>, limit: usize) -> usize {
         let count = self.0.recv_many(buffer, limit).await;
         if count > 0 {
-            retry_backpressured_tcp_output();
+            retry_backpressured_tcp_output(self.1);
         }
         count
     }

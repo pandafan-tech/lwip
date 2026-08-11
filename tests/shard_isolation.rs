@@ -14,15 +14,15 @@ extern "C" {
     fn lwip_rs_set_tcp_tx_partial_checksum(enabled: i32);
     fn lwip_rs_tcp_tx_partial_checksum() -> i32;
 
+    fn panda_shard1_lwip_init();
+    fn panda_shard1_lwip_rs_set_tcp_tx_partial_checksum(enabled: i32);
+    fn panda_shard1_lwip_rs_tcp_tx_partial_checksum() -> i32;
+
     fn panda_shard2_lwip_init();
-    fn panda_shard2_lwip_rs_set_tcp_tx_partial_checksum(enabled: i32);
     fn panda_shard2_lwip_rs_tcp_tx_partial_checksum() -> i32;
 
     fn panda_shard3_lwip_init();
     fn panda_shard3_lwip_rs_tcp_tx_partial_checksum() -> i32;
-
-    fn panda_shard4_lwip_init();
-    fn panda_shard4_lwip_rs_tcp_tx_partial_checksum() -> i32;
 }
 
 #[test]
@@ -31,13 +31,18 @@ fn shard_stacks_own_globals_independent_of_the_primary() {
         // This integration test is its own process; nothing else touches
         // lwIP here, so raw init calls need no LWIP_MUTEX choreography.
         lwip_init();
+        panda_shard1_lwip_init();
         panda_shard2_lwip_init();
         panda_shard3_lwip_init();
-        panda_shard4_lwip_init();
 
         // Primary -> shards: a primary-side write must not leak into any shard.
         lwip_rs_set_tcp_tx_partial_checksum(1);
         assert_eq!(lwip_rs_tcp_tx_partial_checksum(), 1);
+        assert_eq!(
+            panda_shard1_lwip_rs_tcp_tx_partial_checksum(),
+            0,
+            "shard1 aliases the primary stack's globals"
+        );
         assert_eq!(
             panda_shard2_lwip_rs_tcp_tx_partial_checksum(),
             0,
@@ -48,25 +53,20 @@ fn shard_stacks_own_globals_independent_of_the_primary() {
             0,
             "shard3 aliases the primary stack's globals"
         );
-        assert_eq!(
-            panda_shard4_lwip_rs_tcp_tx_partial_checksum(),
-            0,
-            "shard4 aliases the primary stack's globals"
-        );
 
         // Shard -> primary and shard -> shard: the reverse must hold too.
-        panda_shard2_lwip_rs_set_tcp_tx_partial_checksum(1);
+        panda_shard1_lwip_rs_set_tcp_tx_partial_checksum(1);
         lwip_rs_set_tcp_tx_partial_checksum(0);
         assert_eq!(
-            panda_shard2_lwip_rs_tcp_tx_partial_checksum(),
+            panda_shard1_lwip_rs_tcp_tx_partial_checksum(),
             1,
-            "the primary stack's write clobbered shard2"
+            "the primary stack's write clobbered shard1"
         );
         assert_eq!(lwip_rs_tcp_tx_partial_checksum(), 0);
         assert_eq!(
-            panda_shard3_lwip_rs_tcp_tx_partial_checksum(),
+            panda_shard2_lwip_rs_tcp_tx_partial_checksum(),
             0,
-            "shard2's write leaked into shard3"
+            "shard1's write leaked into shard2"
         );
     }
 }

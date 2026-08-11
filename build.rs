@@ -232,7 +232,9 @@ fn generate_lwip_bindings(android_host_profile: bool) {
 fn main() {
     let android_host_profile = android_host_profile();
     compile_lwip(android_host_profile, None);
-    for shard in 2..=(1 + PANDA_LWIP_EXTRA_SHARDS) {
+    // Shard ids are 1-based here so they line up with the Rust-side shard
+    // index: shard 0 is the unprefixed primary, shard k uses panda_shard{k}_.
+    for shard in 1..=PANDA_LWIP_EXTRA_SHARDS {
         compile_lwip(android_host_profile, Some(shard));
     }
     generate_lwip_bindings(android_host_profile);

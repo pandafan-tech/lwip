@@ -1,13 +1,4 @@
-use std::{
-    io,
-    os::raw,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Once,
-    },
-    time,
-};
+use std::{io, os::raw, pin::Pin, sync::atomic::Ordering, time};
 
 #[cfg(any(windows, test))]
 use std::{ffi::OsStr, sync::OnceLock};
@@ -18,12 +9,11 @@ use futures::task::{Context, Poll};
 use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender, WeakSender};
 
 use super::lwip::*;
-use super::output::{output_ip4, output_ip6, OUTPUT_CB_PTR};
+use super::output::output_fns_for;
 use super::packet::{IpPacket, PacketPool, PacketPoolStats};
-use super::{LWIPMutexGuard, LWIP_MUTEX};
+use super::shard::ShardRef;
+use super::LWIPMutexGuard;
 
-static LWIP_INIT: Once = Once::new();
-static EGRESS_BACKPRESSURED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LWIP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) const DEFAULT_MTU: u16 = 1500;
@@ -136,11 +126,25 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
     Ok(())
 }
 
-pub(crate) fn initialize_lwip() {
+pub(crate) fn initialize_lwip(shard: ShardRef) {
     super::mutex::lock_stats::init_from_env();
-    let _guard = LWIP_MUTEX.lock();
+    let _guard = shard.mutex.lock();
     initialize_windows_runtime_config().unwrap_or_else(|error| panic!("{error}"));
-    LWIP_INIT.call_once(|| unsafe { lwip_init() });
+    shard.init.call_once(|| unsafe {
+        // The validated receive window was applied to the primary above;
+        // every other stack copy has its own runtime-window variable that
+        // must see the same value before its first pcb exists.
+        #[cfg(windows)]
+        if let Some(Ok(active_window)) = WINDOWS_TCP_RCV_WINDOW.get() {
+            let result = (shard.vt.tcp_set_wnd_runtime)(*active_window);
+            assert_eq!(
+                result, err_enum_t_ERR_OK as err_t,
+                "shard {} rejected the validated TCP receive window",
+                shard.id
+            );
+        }
+        (shard.vt.lwip_init)()
+    });
 }
 
 /// Switch TCP TX checksums to virtio-style partial mode: lwIP seeds only the
@@ -151,24 +155,23 @@ pub(crate) fn initialize_lwip() {
 ///
 /// Enabling this without a writer that applies those marks (or vice versa)
 /// silently corrupts every TCP packet on the wire; callers own keeping the
-/// two sides in agreement for the lifetime of the stack.
+/// two sides in agreement for the lifetime of the stack. The flag describes
+/// the ONE TUN writer all stacks share, so it applies to every shard.
 pub fn set_tcp_tx_partial_checksum(enabled: bool) {
-    let _guard = LWIP_MUTEX.lock();
-    unsafe { lwip_rs_set_tcp_tx_partial_checksum(i32::from(enabled)) };
+    for shard in super::shard::SHARDS.iter() {
+        let _guard = shard.mutex.lock();
+        unsafe { (shard.vt.lwip_rs_set_tcp_tx_partial_checksum)(i32::from(enabled)) };
+    }
 }
 
-pub(crate) fn mark_egress_backpressured() {
-    EGRESS_BACKPRESSURED.store(true, Ordering::Release);
-}
-
-pub(crate) fn retry_backpressured_tcp_output() {
-    if !EGRESS_BACKPRESSURED.swap(false, Ordering::AcqRel) {
+pub(crate) fn retry_backpressured_tcp_output(shard: ShardRef) {
+    if !shard.egress_backpressured.swap(false, Ordering::AcqRel) {
         return;
     }
 
-    let _guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_RETRY);
-    let err = unsafe { lwip_rs_retry_tcp_output() };
-    if err != err_enum_t_ERR_OK as err_t && !EGRESS_BACKPRESSURED.load(Ordering::Acquire) {
+    let _guard = shard.mutex.lock_at(super::mutex::lock_stats::SITE_RETRY);
+    let err = unsafe { (shard.vt.lwip_rs_retry_tcp_output)() };
+    if err != err_enum_t_ERR_OK as err_t && !shard.egress_backpressured.load(Ordering::Acquire) {
         log::warn!("lwIP deferred TCP output retry failed: {err}");
     }
 }
@@ -188,7 +191,11 @@ unsafe extern "C" fn release_owned_input_pbuf(pbuf: *mut pbuf) {
     drop(unsafe { Box::from_raw(pbuf.cast::<OwnedInputPbuf>()) });
 }
 
-fn input_owned_packet_locked(packet: Vec<u8>, _guard: &LWIPMutexGuard<'_>) -> err_t {
+fn input_owned_packet_locked(
+    packet: Vec<u8>,
+    shard: ShardRef,
+    _guard: &LWIPMutexGuard<'_>,
+) -> err_t {
     let Ok(length) = u16_t::try_from(packet.len()) else {
         log::warn!(
             "input frame exceeds the lwIP pbuf length limit: {} bytes",
@@ -203,7 +210,7 @@ fn input_owned_packet_locked(packet: Vec<u8>, _guard: &LWIPMutexGuard<'_>) -> er
     };
     let mut owned = Box::new(OwnedInputPbuf { custom, packet });
     let pbuf = unsafe {
-        pbuf_alloced_custom(
+        (shard.vt.pbuf_alloced_custom)(
             pbuf_layer_PBUF_RAW,
             length,
             pbuf_type_PBUF_REF,
@@ -226,11 +233,11 @@ fn input_owned_packet_locked(packet: Vec<u8>, _guard: &LWIPMutexGuard<'_>) -> er
     // ERR_OK transfers ownership to lwIP. The IP/TCP/UDP path either releases
     // the pbuf during this call or retains a reference and invokes the custom
     // free callback later.
-    let err = unsafe { lwip_rs_netif_input(pbuf) };
+    let err = unsafe { (shard.vt.lwip_rs_netif_input)(pbuf) };
     if err != err_enum_t_ERR_OK as err_t {
         // A rejected input has not consumed the caller's reference.
         unsafe {
-            pbuf_free(pbuf);
+            (shard.vt.pbuf_free)(pbuf);
         }
         log::warn!("netif input rejected frame: {}", err);
     }
@@ -238,6 +245,7 @@ fn input_owned_packet_locked(packet: Vec<u8>, _guard: &LWIPMutexGuard<'_>) -> er
 }
 
 pub struct NetStackImpl {
+    pub(crate) shard: ShardRef,
     tx: Sender<IpPacket>,
     // Taken by `take_egress()` so a consumer can drain egress packets from a
     // dedicated task while another task feeds ingress through the Sink half.
@@ -255,14 +263,16 @@ pub struct NetStackImpl {
 }
 
 impl NetStackImpl {
-    pub fn new(buffer_size: usize) -> Box<Self> {
-        Self::new_with_mtu(buffer_size, DEFAULT_MTU)
+    #[cfg(test)]
+    pub fn new(buffer_size: usize, shard: ShardRef) -> Box<Self> {
+        Self::new_with_mtu(buffer_size, DEFAULT_MTU, shard)
     }
 
-    pub(crate) fn new_with_mtu(buffer_size: usize, mtu: u16) -> Box<Self> {
-        initialize_lwip();
+    pub(crate) fn new_with_mtu(buffer_size: usize, mtu: u16, shard: ShardRef) -> Box<Self> {
+        initialize_lwip(shard);
 
-        unsafe { lwip_rs_configure_netif(Some(output_ip4), Some(output_ip6), mtu) };
+        let (output_ip4, output_ip6) = output_fns_for(shard.id);
+        unsafe { (shard.vt.lwip_rs_configure_netif)(Some(output_ip4), Some(output_ip6), mtu) };
 
         let (tx, rx): (Sender<IpPacket>, Receiver<IpPacket>) = channel(buffer_size);
         let output_pool = PacketPool::new(
@@ -287,15 +297,17 @@ impl NetStackImpl {
             let mut last_report = time::Instant::now();
             loop {
                 {
-                    let _g = LWIP_MUTEX.lock_at(lock_stats::SITE_TIMER);
-                    unsafe { sys_check_timeouts() };
+                    let _g = shard.mutex.lock_at(lock_stats::SITE_TIMER);
+                    unsafe { (shard.vt.sys_check_timeouts)() };
                     // Timer processing frees pool capacity with no per-pcb
                     // callback (FIN_WAIT/TIME_WAIT reaps, retransmit
                     // consolidation, ooseq trimming); writers parked on
                     // shared-pool exhaustion must still see it.
-                    unsafe { super::tcp_stream_context::pressure_unpark_all_locked() };
+                    unsafe { super::tcp_stream_context::pressure_unpark_all_locked(shard) };
                 }
-                if stats_on {
+                // The stats table aggregates every shard; one printer (the
+                // primary's timer) is enough and avoids duplicate lines.
+                if stats_on && shard.id == 0 {
                     let elapsed = last_report.elapsed();
                     if elapsed >= time::Duration::from_secs(5) {
                         last_report = time::Instant::now();
@@ -312,6 +324,7 @@ impl NetStackImpl {
         });
 
         let stack = Box::new(NetStackImpl {
+            shard,
             tx,
             rx: Some(rx),
             output_pool,
@@ -319,9 +332,9 @@ impl NetStackImpl {
             timeout_task,
         });
 
-        unsafe {
-            OUTPUT_CB_PTR = &*stack as *const NetStackImpl as usize;
-        }
+        shard
+            .output_cb_ptr
+            .store(&*stack as *const NetStackImpl as usize, Ordering::Release);
 
         stack
     }
@@ -349,18 +362,21 @@ impl NetStackImpl {
     }
 
     /// Push a whole batch of ingress IP packets into lwIP under a single
-    /// LWIP_MUTEX acquisition. Per-packet locking dominated the ingress cost
+    /// lock acquisition. Per-packet locking dominated the ingress cost
     /// at high packet rates; a TUN read batch is the natural lock scope.
     pub(crate) fn input_batch<I>(&mut self, items: I)
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
-        let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_INPUT);
+        let guard = self
+            .shard
+            .mutex
+            .lock_at(super::mutex::lock_stats::SITE_INPUT);
         for item in items {
             if item.is_empty() {
                 continue;
             }
-            let _ = input_owned_packet_locked(item, &guard);
+            let _ = input_owned_packet_locked(item, self.shard, &guard);
         }
     }
 
@@ -382,15 +398,18 @@ impl Drop for NetStackImpl {
             stats.cached
         );
         self.timeout_task.abort();
-        unsafe {
-            let _g = LWIP_MUTEX.lock();
+        {
+            let _g = self.shard.mutex.lock();
             // Only clear the output hook if it still points at us. If a
             // successor stack was created before this one finished tearing
             // down (a stop/start race in the consumer), unconditionally
             // zeroing here would sever the LIVE stack's egress path.
-            if OUTPUT_CB_PTR == self as *const NetStackImpl as usize {
-                OUTPUT_CB_PTR = 0x0;
-            }
+            let _ = self.shard.output_cb_ptr.compare_exchange(
+                self as *const NetStackImpl as usize,
+                0x0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
         };
     }
 }
@@ -411,7 +430,7 @@ impl Stream for NetStackImpl {
             Poll::Pending => Poll::Pending,
         };
         if matches!(&result, Poll::Ready(Some(_))) {
-            retry_backpressured_tcp_output();
+            retry_backpressured_tcp_output(self.shard);
         }
         result
     }
@@ -441,8 +460,8 @@ impl Sink<Vec<u8>> for NetStackImpl {
             if item.is_empty() {
                 return Poll::Ready(Ok(()));
             }
-            let guard = LWIP_MUTEX.lock();
-            let _ = input_owned_packet_locked(item, &guard);
+            let guard = self.shard.mutex.lock();
+            let _ = input_owned_packet_locked(item, self.shard, &guard);
             // A rejected frame is a per-packet event, not a stack-fatal one.
             // Callers treat a Sink error as fatal and tear down the packet
             // path, so preserve the IP-device behavior of dropping it.
@@ -460,6 +479,8 @@ impl Sink<Vec<u8>> for NetStackImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::primary;
+    use crate::LWIP_MUTEX;
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -494,7 +515,7 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        initialize_lwip();
+        initialize_lwip(primary());
 
         let cases = [
             ([198, 18, 0, 1], [10, 231, 0, 10], 1480u16),
@@ -537,7 +558,7 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        initialize_lwip();
+        initialize_lwip(primary());
 
         assert_eq!(unsafe { lwip_rs_tcp_tx_partial_checksum() }, 0);
         set_tcp_tx_partial_checksum(true);
@@ -551,7 +572,7 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        initialize_lwip();
+        initialize_lwip(primary());
         let _guard = LWIP_MUTEX.lock();
 
         unsafe {
@@ -603,7 +624,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let stack = NetStackImpl::new(1);
+                let stack = NetStackImpl::new(1, primary());
                 {
                     let guard = LWIP_MUTEX.lock();
                     let previous = unsafe { netif_list };
@@ -612,7 +633,7 @@ mod tests {
                         netif_list = std::ptr::null_mut();
                     }
 
-                    let err = input_owned_packet_locked(vec![0x45; 20], &guard);
+                    let err = input_owned_packet_locked(vec![0x45; 20], primary(), &guard);
                     assert_eq!(err, err_enum_t_ERR_IF as err_t);
                 }
                 drop(stack);
@@ -740,7 +761,7 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        initialize_lwip();
+        initialize_lwip(primary());
         let _guard = LWIP_MUTEX.lock();
 
         unsafe {
@@ -758,7 +779,7 @@ mod tests {
         let _test_guard = LWIP_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        initialize_lwip();
+        initialize_lwip(primary());
         let _guard = LWIP_MUTEX.lock();
 
         unsafe {

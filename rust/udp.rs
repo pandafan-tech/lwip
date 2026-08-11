@@ -22,6 +22,7 @@ use tokio::sync::{
 
 use super::lwip::*;
 use super::packet::{IpPacket, PacketPool};
+use super::shard::ShardRef;
 use super::util;
 use crate::Error;
 
@@ -295,9 +296,9 @@ unsafe fn copy_udp_packet(
     let mut packet = socket.packet_pool.acquire(tot_len as usize);
     let copied = {
         let spare = packet.spare_capacity_mut();
-        pbuf_copy_partial(p, spare.as_mut_ptr().cast(), tot_len, 0)
+        (socket.shard.vt.pbuf_copy_partial)(p, spare.as_mut_ptr().cast(), tot_len, 0)
     };
-    pbuf_free(p);
+    (socket.shard.vt.pbuf_free)(p);
     if copied != tot_len {
         warn!("short lwIP UDP pbuf copy: {copied}/{tot_len}");
         return None;
@@ -380,6 +381,7 @@ unsafe extern "C" fn udp_recv_direct_cb(
 }
 
 fn send_udp(
+    shard: ShardRef,
     src_addr: &SocketAddr,
     dst_addr: &SocketAddr,
     pcb: usize,
@@ -388,7 +390,7 @@ fn send_udp(
     required_slots: usize,
 ) -> io::Result<()> {
     unsafe {
-        let _g = super::LWIP_MUTEX.lock();
+        let _g = shard.mutex.lock();
         if required_slots > egress_tx.max_capacity() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -407,11 +409,14 @@ fn send_udp(
                 ),
             ));
         }
-        let pbuf =
-            pbuf_alloc_reference(data.as_ptr() as *mut _, data.len() as _, pbuf_type_PBUF_REF);
+        let pbuf = (shard.vt.pbuf_alloc_reference)(
+            data.as_ptr() as *mut _,
+            data.len() as _,
+            pbuf_type_PBUF_REF,
+        );
         let src_ip = util::to_ip_addr_t(src_addr.ip());
         let dst_ip = util::to_ip_addr_t(dst_addr.ip());
-        let err = lwip_rs_udp_sendto(
+        let err = (shard.vt.lwip_rs_udp_sendto)(
             pcb as *mut udp_pcb,
             pbuf,
             &dst_ip as *const _,
@@ -419,7 +424,7 @@ fn send_udp(
             &src_ip as *const _,
             src_addr.port(),
         );
-        pbuf_free(pbuf);
+        (shard.vt.pbuf_free)(pbuf);
         if err != err_enum_t_ERR_OK as err_t {
             let kind = match err {
                 value if value == err_enum_t_ERR_ABRT as err_t => io::ErrorKind::BrokenPipe,
@@ -432,6 +437,7 @@ fn send_udp(
 }
 
 pub struct UdpSocket {
+    shard: ShardRef,
     pcb: usize,
     waker: Option<Waker>,
     #[cfg(windows)]
@@ -454,25 +460,27 @@ impl UdpSocket {
         buffer_size: usize,
         egress_tx: WeakSender<IpPacket>,
         mtu: u16,
+        shard: ShardRef,
     ) -> Result<Box<Self>, Error> {
         #[cfg(windows)]
         let runtime_config = windows_udp_runtime_config();
-        let _guard = super::LWIP_MUTEX.lock();
+        let _guard = shard.mutex.lock();
         unsafe {
-            let pcb = udp_new();
+            let pcb = (shard.vt.udp_new)();
             if pcb.is_null() {
                 error!("create UDP PCB failed: out of lwIP memory");
                 return Err(Error::LwIP(err_enum_t_ERR_MEM as err_t));
             }
-            let err = udp_bind(pcb, &ip_addr_any_type, 0);
+            let err = (shard.vt.udp_bind)(pcb, &ip_addr_any_type, 0);
             if err != err_enum_t_ERR_OK as err_t {
                 error!("bind UDP failed: {}", err);
-                udp_remove(pcb);
+                (shard.vt.udp_remove)(pcb);
                 return Err(Error::LwIP(err));
             }
             let (tx, rx): (Sender<UdpPkt>, Receiver<UdpPkt>) = channel(buffer_size);
             let packet_pool = PacketPool::new(buffer_size.clamp(1, 256), 4 * 1024);
             let socket = Box::new(Self {
+                shard,
                 pcb: pcb as usize,
                 waker: None,
                 #[cfg(windows)]
@@ -490,7 +498,7 @@ impl UdpSocket {
                 packet_pool,
             });
             let arg = &*socket as *const UdpSocket as *mut raw::c_void;
-            udp_recv(pcb, Some(udp_recv_cb), arg);
+            (shard.vt.udp_recv)(pcb, Some(udp_recv_cb), arg);
             Ok(socket)
         }
     }
@@ -498,6 +506,7 @@ impl UdpSocket {
     pub fn split(self: Box<Self>) -> (SendHalf, RecvHalf) {
         (
             SendHalf {
+                shard: self.shard,
                 pcb: self.pcb,
                 egress_tx: self.egress_tx.clone(),
                 mtu: self.mtu,
@@ -516,7 +525,7 @@ impl UdpSocket {
             let pcb = self.pcb as *mut udp_pcb;
             let mut ip = std::mem::zeroed();
             let mut port = 0;
-            lwip_rs_udp_local_endpoint(pcb, &mut ip, &mut port);
+            (self.shard.vt.lwip_rs_udp_local_endpoint)(pcb, &mut ip, &mut port);
             util::to_socket_addr(&ip, port)
         }
     }
@@ -524,10 +533,10 @@ impl UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        let _guard = super::LWIP_MUTEX.lock();
+        let _guard = self.shard.mutex.lock();
         unsafe {
-            udp_recv(self.pcb as *mut udp_pcb, None, std::ptr::null_mut());
-            udp_remove(self.pcb as *mut udp_pcb);
+            (self.shard.vt.udp_recv)(self.pcb as *mut udp_pcb, None, std::ptr::null_mut());
+            (self.shard.vt.udp_remove)(self.pcb as *mut udp_pcb);
         }
     }
 }
@@ -536,7 +545,7 @@ impl Stream for UdpSocket {
     type Item = UdpPkt;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let _g = super::LWIP_MUTEX.lock();
+        let _g = self.shard.mutex.lock();
         #[cfg(any(windows, test))]
         if self.direct_ingress_handler.is_some() {
             return Poll::Pending;
@@ -562,6 +571,7 @@ impl Stream for UdpSocket {
 }
 
 pub struct SendHalf {
+    shard: ShardRef,
     pub(crate) pcb: usize,
     egress_tx: WeakSender<IpPacket>,
     mtu: u16,
@@ -583,7 +593,15 @@ impl SendHalf {
         let sender = self.egress_tx.upgrade().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "lwIP egress queue is closed")
         })?;
-        send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots)
+        send_udp(
+            self.shard,
+            src_addr,
+            dst_addr,
+            self.pcb,
+            data,
+            &sender,
+            required_slots,
+        )
     }
 
     /// Send a datagram without dropping it when the bounded stack-egress
@@ -633,7 +651,15 @@ impl SendHalf {
                 })?;
                 drop(permits);
 
-                match send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots) {
+                match send_udp(
+                    self.shard,
+                    src_addr,
+                    dst_addr,
+                    self.pcb,
+                    data,
+                    &sender,
+                    required_slots,
+                ) {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     result => return result,
                 }
@@ -657,7 +683,15 @@ impl SendHalf {
             let sender = self.egress_tx.upgrade().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "lwIP egress queue is closed")
             })?;
-            match send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots) {
+            match send_udp(
+                self.shard,
+                src_addr,
+                dst_addr,
+                self.pcb,
+                data,
+                &sender,
+                required_slots,
+            ) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
@@ -683,7 +717,15 @@ impl SendHalf {
             }
 
             if reserve_mode == WindowsUdpReserveMode::OnBlock {
-                match send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots) {
+                match send_udp(
+                    self.shard,
+                    src_addr,
+                    dst_addr,
+                    self.pcb,
+                    data,
+                    &sender,
+                    required_slots,
+                ) {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     result => return result,
                 }
@@ -698,7 +740,15 @@ impl SendHalf {
             })?;
             drop(permits);
 
-            match send_udp(src_addr, dst_addr, self.pcb, data, &sender, required_slots) {
+            match send_udp(
+                self.shard,
+                src_addr,
+                dst_addr,
+                self.pcb,
+                data,
+                &sender,
+                required_slots,
+            ) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
@@ -760,7 +810,7 @@ impl RecvHalf {
     where
         F: Fn(UdpPkt) + Send + Sync + 'static,
     {
-        let _guard = super::LWIP_MUTEX.lock();
+        let _guard = self.socket.shard.mutex.lock();
         if self.socket.direct_ingress_handler.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -771,7 +821,7 @@ impl RecvHalf {
         unsafe {
             let pcb = self.socket.pcb as *mut udp_pcb;
             let arg = &*self.socket as *const UdpSocket as *mut raw::c_void;
-            udp_recv(pcb, Some(udp_recv_direct_cb), arg);
+            (self.socket.shard.vt.udp_recv)(pcb, Some(udp_recv_direct_cb), arg);
         }
         Ok(())
     }
@@ -787,7 +837,7 @@ impl RecvHalf {
     }
 
     pub fn try_recv_from(&mut self) -> io::Result<Option<UdpPkt>> {
-        let _guard = super::LWIP_MUTEX.lock();
+        let _guard = self.socket.shard.mutex.lock();
         #[cfg(any(windows, test))]
         if self.socket.direct_ingress_handler.is_some() {
             return Ok(None);
@@ -803,7 +853,7 @@ impl RecvHalf {
     }
 
     pub fn try_recv_many(&mut self, buffer: &mut Vec<UdpPkt>, limit: usize) -> io::Result<usize> {
-        let _guard = super::LWIP_MUTEX.lock();
+        let _guard = self.socket.shard.mutex.lock();
         #[cfg(any(windows, test))]
         if self.socket.direct_ingress_handler.is_some() {
             return Ok(0);
@@ -1136,7 +1186,7 @@ mod tests {
                 let (finished_tx, finished_rx) = std::sync::mpsc::channel();
                 let create_thread = std::thread::spawn(move || {
                     started_tx.send(()).unwrap();
-                    let socket = UdpSocket::new(1, weak_egress, 1500);
+                    let socket = UdpSocket::new(1, weak_egress, 1500, crate::shard::primary());
                     finished_tx.send(socket.is_ok()).unwrap();
                     drop(socket);
                 });
