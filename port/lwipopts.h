@@ -105,7 +105,19 @@
 #define CHECKSUM_CHECK_ICMP 0
 #define CHECKSUM_CHECK_ICMP6 0
 
+#if defined(__linux__) && !defined(__ANDROID__) && \
+    !defined(PANDA_LWIP_ANDROID_PROFILE)
+// Desktop Linux hands TCP TX checksums to the kernel through the TUN vnet
+// header (virtio NEEDS_CSUM partial checksums, see panda_tcp_tx_partial_chksum
+// in tcp_out.c), so computing payload checksums during tcp_write would be
+// wasted work — lwip_chksum_copy alone was 7.2% of CPU in the 16-flow
+// bidirectional profile (2026-08-11). If the runtime flag is off (TX GSO
+// experiments, non-vnet writers) the full checksum is still generated at
+// output time from the same CHECKSUM_GEN_TCP site.
+#define LWIP_CHECKSUM_ON_COPY 0
+#else
 #define LWIP_CHECKSUM_ON_COPY 1
+#endif
 #define LWIP_CHKSUM_ALGORITHM 3
 
 #define PANDA_BASE_TCP_MSS 1460

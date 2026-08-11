@@ -142,6 +142,20 @@ pub(crate) fn initialize_lwip() {
     LWIP_INIT.call_once(|| unsafe { lwip_init() });
 }
 
+/// Switch TCP TX checksums to virtio-style partial mode: lwIP seeds only the
+/// folded pseudo-header sum and the TUN writer must mark every TCP packet
+/// `VIRTIO_NET_HDR_F_NEEDS_CSUM` (csum_start = IP header length,
+/// csum_offset = 16) so the kernel completes — or, for local delivery,
+/// skips — the payload checksum.
+///
+/// Enabling this without a writer that applies those marks (or vice versa)
+/// silently corrupts every TCP packet on the wire; callers own keeping the
+/// two sides in agreement for the lifetime of the stack.
+pub fn set_tcp_tx_partial_checksum(enabled: bool) {
+    let _guard = LWIP_MUTEX.lock();
+    unsafe { lwip_rs_set_tcp_tx_partial_checksum(i32::from(enabled)) };
+}
+
 pub(crate) fn mark_egress_backpressured() {
     EGRESS_BACKPRESSURED.store(true, Ordering::Release);
 }
@@ -456,6 +470,67 @@ mod tests {
                 assert_eq!(tcp_set_wnd_runtime(self.0), err_enum_t_ERR_OK as err_t);
             }
         }
+    }
+
+    /// The virtio NEEDS_CSUM contract: the checksum field must be seeded
+    /// with the folded, un-complemented ones-complement sum of the TCP
+    /// pseudo header (src, dst, zero, proto, tcp length). Computed here
+    /// independently, byte for byte, per RFC 793.
+    #[test]
+    fn tcp_partial_pseudo_checksum_matches_an_independent_reference() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        initialize_lwip();
+
+        let cases = [
+            ([198, 18, 0, 1], [10, 231, 0, 10], 1480u16),
+            ([10, 0, 0, 1], [10, 0, 0, 2], 0),
+            ([255, 255, 255, 255], [255, 255, 255, 255], 65495),
+            ([1, 2, 3, 4], [5, 6, 7, 8], 20),
+        ];
+        for (src, dst, tcp_len) in cases {
+            let mut pseudo = Vec::with_capacity(12);
+            pseudo.extend_from_slice(&src);
+            pseudo.extend_from_slice(&dst);
+            pseudo.extend_from_slice(&[0, 6]); // zero, IPPROTO_TCP
+            pseudo.extend_from_slice(&tcp_len.to_be_bytes());
+            let mut sum = 0u32;
+            for pair in pseudo.chunks(2) {
+                sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            let expected = sum as u16;
+
+            let src_be = u32::from_ne_bytes(src);
+            let dst_be = u32::from_ne_bytes(dst);
+            let got = {
+                let _guard = LWIP_MUTEX.lock();
+                unsafe { lwip_rs_tcp_partial_pseudo_checksum_ipv4(src_be, dst_be, tcp_len) }
+            };
+            // lwIP stores checksums in network byte order within the u16.
+            assert_eq!(
+                u16::from_be(got),
+                expected,
+                "pseudo sum mismatch for {src:?}->{dst:?} len {tcp_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_tx_partial_checksum_flag_round_trips() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        initialize_lwip();
+
+        assert_eq!(unsafe { lwip_rs_tcp_tx_partial_checksum() }, 0);
+        set_tcp_tx_partial_checksum(true);
+        assert_eq!(unsafe { lwip_rs_tcp_tx_partial_checksum() }, 1);
+        set_tcp_tx_partial_checksum(false);
+        assert_eq!(unsafe { lwip_rs_tcp_tx_partial_checksum() }, 0);
     }
 
     #[test]

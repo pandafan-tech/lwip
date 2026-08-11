@@ -85,3 +85,33 @@ err_t lwip_rs_udp_sendto(struct udp_pcb *pcb,
   pcb->local_port = previous_port;
   return err;
 }
+
+/* Defined in src/core/tcp_out.c; gates virtio-style partial TCP TX
+   checksums (pseudo-header seed only, completed by the kernel from the
+   NEEDS_CSUM vnet header the TUN writer attaches). */
+extern u8_t panda_tcp_tx_partial_chksum;
+
+void
+lwip_rs_set_tcp_tx_partial_checksum(int enabled)
+{
+  panda_tcp_tx_partial_chksum = enabled ? 1 : 0;
+}
+
+int
+lwip_rs_tcp_tx_partial_checksum(void)
+{
+  return panda_tcp_tx_partial_chksum;
+}
+
+/* Test hook: the folded, un-complemented IPv4/TCP pseudo-header sum exactly
+   as the partial-checksum mode seeds it into the TCP checksum field. */
+u16_t
+lwip_rs_tcp_partial_pseudo_checksum_ipv4(u32_t src_be, u32_t dst_be, u16_t tcp_len)
+{
+  ip4_addr_t src;
+  ip4_addr_t dst;
+  ip4_addr_set_u32(&src, src_be);
+  ip4_addr_set_u32(&dst, dst_be);
+  return (u16_t)~inet_chksum_pseudo_partial(NULL, IP_PROTO_TCP, tcp_len, 0,
+                                            &src, &dst);
+}

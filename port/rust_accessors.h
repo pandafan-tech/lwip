@@ -18,6 +18,11 @@ void lwip_rs_tcp_endpoints(const struct tcp_pcb *pcb,
 void lwip_rs_tcp_apply_options(struct tcp_pcb *pcb, int keepalive);
 tcpwnd_size_t lwip_rs_tcp_send_buffer(const struct tcp_pcb *pcb);
 err_t lwip_rs_retry_tcp_output(void);
+void lwip_rs_set_tcp_tx_partial_checksum(int enabled);
+int lwip_rs_tcp_tx_partial_checksum(void);
+u16_t lwip_rs_tcp_partial_pseudo_checksum_ipv4(u32_t src_be,
+                                               u32_t dst_be,
+                                               u16_t tcp_len);
 
 void lwip_rs_udp_local_endpoint(const struct udp_pcb *pcb,
                                 ip_addr_t *local_ip,

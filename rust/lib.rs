@@ -23,7 +23,7 @@ pub use packet::{
 };
 pub use pbuf_pool::{configure_pbuf_pool_capacity, pbuf_pool_runtime_stats, PbufPoolRuntimeStats};
 pub use stack::{NetStack, StackEgress, StackIngress};
-pub use stack_impl::initialize_windows_runtime_config;
+pub use stack_impl::{initialize_windows_runtime_config, set_tcp_tx_partial_checksum};
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;
 pub use tcp_stream_context::{tcp_runtime_stats, TcpRuntimeStats};

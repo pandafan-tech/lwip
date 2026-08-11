@@ -84,6 +84,20 @@
 #include LWIP_HOOK_FILENAME
 #endif
 
+#if CHECKSUM_GEN_TCP
+/* PandaFan: when set, every emitted TCP packet carries a virtio-style
+   partial checksum: the checksum field is seeded with the folded,
+   un-complemented pseudo-header sum and the TUN writer marks the packet
+   VIRTIO_NET_HDR_F_NEEDS_CSUM (csum_start = IP header length,
+   csum_offset = 16) so the kernel completes it over the TCP header and
+   payload — or skips it entirely for local delivery. The flag must only be
+   enabled when the egress path actually applies those marks to every TCP
+   packet; the two checksum sites below (data/retransmit segments in
+   tcp_output_segment and all control segments in
+   tcp_output_control_segment_netif) are the only TCP checksum producers. */
+u8_t panda_tcp_tx_partial_chksum;
+#endif /* CHECKSUM_GEN_TCP */
+
 /* Allow to add custom TCP header options by defining this hook */
 #ifdef LWIP_HOOK_TCP_OUT_TCPOPT_LENGTH
 #define LWIP_TCP_OPT_LENGTH_SEGMENT(flags, pcb) LWIP_HOOK_TCP_OUT_TCPOPT_LENGTH(pcb, LWIP_TCP_OPT_LENGTH(flags))
@@ -1569,6 +1583,13 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
 
 #if CHECKSUM_GEN_TCP
   IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_TCP) {
+    if (panda_tcp_tx_partial_chksum) {
+      /* Seed the folded, un-complemented pseudo-header sum; a zero checksum
+         length makes ip_chksum_pseudo_partial sum only the pseudo header,
+         and its store-ready result is complemented back into a raw sum. */
+      seg->tcphdr->chksum = (u16_t)~ip_chksum_pseudo_partial(seg->p, IP_PROTO_TCP,
+                                     seg->p->tot_len, 0, &pcb->local_ip, &pcb->remote_ip);
+    } else {
 #if TCP_CHECKSUM_ON_COPY
     u32_t acc;
 #if TCP_CHECKSUM_ON_COPY_SANITY_CHECK
@@ -1603,6 +1624,7 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
     seg->tcphdr->chksum = ip_chksum_pseudo(seg->p, IP_PROTO_TCP,
                                            seg->p->tot_len, &pcb->local_ip, &pcb->remote_ip);
 #endif /* TCP_CHECKSUM_ON_COPY */
+    }
   }
 #endif /* CHECKSUM_GEN_TCP */
   TCP_STATS_INC(tcp.xmit);
@@ -1955,8 +1977,13 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
 #if CHECKSUM_GEN_TCP
   IF__NETIF_CHECKSUM_ENABLED(netif, NETIF_CHECKSUM_GEN_TCP) {
     struct tcp_hdr *tcphdr = (struct tcp_hdr *)p->payload;
-    tcphdr->chksum = ip_chksum_pseudo(p, IP_PROTO_TCP, p->tot_len,
-                                      src, dst);
+    if (panda_tcp_tx_partial_chksum) {
+      tcphdr->chksum = (u16_t)~ip_chksum_pseudo_partial(p, IP_PROTO_TCP,
+                                                        p->tot_len, 0, src, dst);
+    } else {
+      tcphdr->chksum = ip_chksum_pseudo(p, IP_PROTO_TCP, p->tot_len,
+                                        src, dst);
+    }
   }
 #endif
   if (pcb != NULL) {
