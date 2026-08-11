@@ -50,7 +50,7 @@ pub unsafe extern "C" fn tcp_recv_cb(
         (shard.vt.pbuf_free)(p);
         return err_enum_t_ERR_OK as err_t;
     }
-    ctx.read_queue.push_back(QueuedPbuf::new(p));
+    ctx.read_queue.push_back(QueuedPbuf::new(p, shard));
     if let Some(waker) = ctx.read_waker.take() {
         waker.wake();
     }
@@ -182,7 +182,7 @@ impl TcpStreamImpl {
                 spent: Vec::new(),
                 pending_recved: 0,
                 callback_ctx: TcpStreamContext::new(src_addr, shard),
-                _active: ActiveTcpStream::new(),
+                _active: ActiveTcpStream::new(shard),
             });
             let arg = &stream.callback_ctx as *const _;
             (shard.vt.tcp_arg)(pcb, arg as *mut raw::c_void);

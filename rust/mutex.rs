@@ -133,7 +133,12 @@ pub mod lock_stats {
     }
 }
 
+// One cache line per lock (128 covers Apple Silicon lines and the x86
+// adjacent-line prefetcher pair): the per-shard mutexes live in adjacent
+// statics, and two shards spin-waiting on one shared line would ping-pong
+// it between cores at packet rate.
 #[derive(Debug)]
+#[repr(align(128))]
 pub struct AtomicMutex {
     locked: AtomicBool,
 }

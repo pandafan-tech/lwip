@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use super::lwip::pbuf;
@@ -13,10 +13,6 @@ use super::LWIPMutexGuard;
 
 const TCP_READ_QUEUE_INITIAL_CAPACITY: usize = 32;
 
-static ACTIVE_TCP_STREAMS: AtomicUsize = AtomicUsize::new(0);
-static TCP_QUEUED_PACKETS: AtomicUsize = AtomicUsize::new(0);
-static TCP_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpRuntimeStats {
     pub active_streams: usize,
@@ -24,12 +20,16 @@ pub struct TcpRuntimeStats {
     pub queued_bytes: usize,
 }
 
+/// Aggregate view across every shard. The counters live per shard so four
+/// stacks never do RMWs on one shared cache line at packet rate.
 pub fn tcp_runtime_stats() -> TcpRuntimeStats {
-    TcpRuntimeStats {
-        active_streams: ACTIVE_TCP_STREAMS.load(Ordering::Relaxed),
-        queued_packets: TCP_QUEUED_PACKETS.load(Ordering::Relaxed),
-        queued_bytes: TCP_QUEUED_BYTES.load(Ordering::Relaxed),
+    let mut stats = TcpRuntimeStats::default();
+    for shard in super::shard::SHARDS.iter() {
+        stats.active_streams += shard.active_tcp_streams.load(Ordering::Relaxed);
+        stats.queued_packets += shard.tcp_queued_packets.load(Ordering::Relaxed);
+        stats.queued_bytes += shard.tcp_queued_bytes.load(Ordering::Relaxed);
     }
+    stats
 }
 
 /// A pbuf chain surrendered by lwIP's receive callback, owned exclusively by
@@ -43,6 +43,7 @@ pub fn tcp_runtime_stats() -> TcpRuntimeStats {
 pub struct QueuedPbuf {
     head: *mut pbuf,
     bytes: usize,
+    shard: ShardRef,
 }
 
 // SAFETY: the chain is exclusively owned (lwIP surrendered it to the receive
@@ -56,12 +57,13 @@ unsafe impl Sync for QueuedPbuf {}
 impl QueuedPbuf {
     /// # Safety
     /// `head` must be a pbuf chain the caller exclusively owns — fresh from
-    /// lwIP's `tcp_recv` callback, which transfers ownership to the callee.
-    pub unsafe fn new(head: *mut pbuf) -> Self {
+    /// `shard`'s `tcp_recv` callback, which transfers ownership to the
+    /// callee.
+    pub unsafe fn new(head: *mut pbuf, shard: ShardRef) -> Self {
         let bytes = usize::from(std::ptr::read_unaligned(head).tot_len);
-        TCP_QUEUED_PACKETS.fetch_add(1, Ordering::Relaxed);
-        TCP_QUEUED_BYTES.fetch_add(bytes, Ordering::Relaxed);
-        Self { head, bytes }
+        shard.tcp_queued_packets.fetch_add(1, Ordering::Relaxed);
+        shard.tcp_queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self { head, bytes, shard }
     }
 
     pub fn head(&self) -> *mut pbuf {
@@ -79,8 +81,12 @@ impl QueuedPbuf {
 
 impl Drop for QueuedPbuf {
     fn drop(&mut self) {
-        TCP_QUEUED_PACKETS.fetch_sub(1, Ordering::Relaxed);
-        TCP_QUEUED_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.shard
+            .tcp_queued_packets
+            .fetch_sub(1, Ordering::Relaxed);
+        self.shard
+            .tcp_queued_bytes
+            .fetch_sub(self.bytes, Ordering::Relaxed);
         // A chain dropped without free_locked cannot be freed here — this
         // Drop is not guaranteed to run under the lock. Leaking it is the
         // safe failure; debug builds refuse to let the path exist.
@@ -91,18 +97,18 @@ impl Drop for QueuedPbuf {
     }
 }
 
-pub struct ActiveTcpStream;
+pub struct ActiveTcpStream(ShardRef);
 
 impl ActiveTcpStream {
-    pub fn new() -> Self {
-        ACTIVE_TCP_STREAMS.fetch_add(1, Ordering::Relaxed);
-        Self
+    pub fn new(shard: ShardRef) -> Self {
+        shard.active_tcp_streams.fetch_add(1, Ordering::Relaxed);
+        Self(shard)
     }
 }
 
 impl Drop for ActiveTcpStream {
     fn drop(&mut self) {
-        ACTIVE_TCP_STREAMS.fetch_sub(1, Ordering::Relaxed);
+        self.0.active_tcp_streams.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

@@ -63,13 +63,15 @@ fn udp_catchall_delivers_and_replies_with_original_tuple() {
                 .expect("catch-all UDP PCB never saw the datagram")
                 .expect("udp socket closed before delivering the datagram");
 
-            let expected_src: SocketAddr =
-                (std::net::IpAddr::from(CLIENT_IP), CLIENT_PORT).into();
+            let expected_src: SocketAddr = (std::net::IpAddr::from(CLIENT_IP), CLIENT_PORT).into();
             let expected_dst: SocketAddr =
                 (std::net::IpAddr::from(FOREIGN_IP), FOREIGN_PORT).into();
             assert_eq!(&packet[..], payload, "payload must survive the stack");
             assert_eq!(src, expected_src, "original source tuple must be preserved");
-            assert_eq!(dst, expected_dst, "original destination tuple must be preserved");
+            assert_eq!(
+                dst, expected_dst,
+                "original destination tuple must be preserved"
+            );
 
             // Reply: sending with the foreign tuple as source must egress an
             // IPv4/UDP packet spoofing that source back to the client.
@@ -83,7 +85,11 @@ fn udp_catchall_delivers_and_replies_with_original_tuple() {
                 .expect("lwIP egress closed before the UDP reply");
 
             assert_eq!(reply[9], 17, "reply must be UDP");
-            assert_eq!(&reply[12..16], &FOREIGN_IP, "reply source IP must be spoofed");
+            assert_eq!(
+                &reply[12..16],
+                &FOREIGN_IP,
+                "reply source IP must be spoofed"
+            );
             assert_eq!(&reply[16..20], &CLIENT_IP, "reply must target the client");
             assert_eq!(
                 u16::from_be_bytes([reply[20], reply[21]]),

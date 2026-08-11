@@ -127,6 +127,9 @@ mod vt3 {
 
 /// One lwIP instance plus the Rust-side state that serializes and services
 /// it. Fields mirror what used to be crate-wide statics, one copy per shard.
+/// Cache-line-aligned so adjacent shards' hot atomics (backpressure flag,
+/// telemetry counters) never share a line.
+#[repr(align(128))]
 pub(crate) struct ShardState {
     pub id: usize,
     pub vt: &'static ShardVt,
@@ -141,6 +144,12 @@ pub(crate) struct ShardState {
     pub output_cb_ptr: AtomicUsize,
     /// Writers on THIS shard parked on its shared-pool exhaustion.
     pub mem_pressure: TcpMemPressureQueue,
+    /// Per-shard TCP telemetry. Split per shard because the queued-packet
+    /// pair is bumped for every delivered chain: four stacks doing RMWs on
+    /// one shared cache line would serialize on the coherence traffic.
+    pub active_tcp_streams: std::sync::atomic::AtomicUsize,
+    pub tcp_queued_packets: std::sync::atomic::AtomicUsize,
+    pub tcp_queued_bytes: std::sync::atomic::AtomicUsize,
 }
 
 // SAFETY: raw-pointer-holding fields (mem_pressure) are only touched under
@@ -165,6 +174,9 @@ macro_rules! shard_state {
             egress_backpressured: AtomicBool::new(false),
             output_cb_ptr: AtomicUsize::new(0),
             mem_pressure: TcpMemPressureQueue::new(),
+            active_tcp_streams: AtomicUsize::new(0),
+            tcp_queued_packets: AtomicUsize::new(0),
+            tcp_queued_bytes: AtomicUsize::new(0),
         }
     };
 }
