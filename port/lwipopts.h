@@ -205,10 +205,19 @@
 #if defined(_WIN32)
 #define TCP_WND (2872 * PANDA_BASE_TCP_MSS)
 #define TCP_WND_RUNTIME_DEFAULT (512 * PANDA_BASE_TCP_MSS)
+// The send buffer bounds the DOWNLOAD direction the way the receive window
+// bounds upload, and the lwIP tuning guidance is explicit that it must
+// cover the window to reach full throughput. Windows tuned its receive
+// side to the 512-MSS class but left the send buffer at 256 MSS
+// (373 KiB): on the virtualized-TUN 3-6 ms RTT that caps a single
+// download flow at ~600 Mbit/s (373 KiB per round trip) regardless of
+// CPU. Match the active window class; per-connection payload memory is
+// heap-on-demand (MEM_LIBC_MALLOC), not a static allocation.
+#define TCP_SND_BUF (512 * PANDA_BASE_TCP_MSS)
 #else
 #define TCP_WND (256 * PANDA_BASE_TCP_MSS)
-#endif
 #define TCP_SND_BUF (256 * PANDA_BASE_TCP_MSS)
+#endif
 // Sized for the smallest runtime MSS (see PANDA_MIN_EFF_TCP_MSS): a full
 // send buffer at MSS 536 needs ~698 segments and interleaved partial
 // segments push past that; the previous fixed 512 starved exactly there
