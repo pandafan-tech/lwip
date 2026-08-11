@@ -184,39 +184,39 @@
 #if defined __APPLE__
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
+// The fixed lwIP heap is a deliberate hard cap on the Network Extension's
+// TCP payload memory (jetsam budget); mobile stays on mem.c.
 #define MEM_SIZE (512 * 1024)
-#else
-// tcp_write(COPY) payloads live in this heap, so the desktop heap must hold
-// the full MEMP_NUM_TCP_SEG segment pool worth of in-flight bulk data
-// (16384 * ~1.55 KiB ≈ 25 MiB at 1460-byte MSS) plus transient header
-// pbufs. The heap is BSS: untouched pages stay clean, idle RSS does not
-// grow.
-#define MEM_SIZE (32 * 1024 * 1024)
 #endif
 #elif defined(__ANDROID__) || defined(PANDA_LWIP_ANDROID_PROFILE)
-// Mobile budget: keep the Android heap at its validated size; the desktop
-// send-buffer bump above does not apply to this tier either.
+// Mobile budget: keep the Android heap at its validated size.
 #define MEM_SIZE (2 * 1024 * 1024)
-#else
-#define MEM_SIZE (32 * 1024 * 1024)
 #endif
 
 #if (defined __APPLE__ && TARGET_OS_IPHONE) || defined(__ANDROID__) || \
     defined(PANDA_LWIP_ANDROID_PROFILE)
 // Mobile keeps the validated pool; its small per-pcb send buffers (16-64
-// MSS) never sit at the pool boundary the way desktop's do.
+// MSS) never sit at the pool boundary the way desktop's do. The small
+// mobile heaps also bound mem.c's scan cost to a few hundred blocks.
 #define MEMP_NUM_TCP_SEG 4096
 #else
-// Desktop: 16 bulk flows * 256-MSS send buffers consume 4096 segments
-// nominally — the previous pool size exactly, with zero slack — and partial
-// segments (tcp_output interleaving with tcp_write) push demand past it, so
-// every tcp_write at 16 flows lived on the shared-pool ERR_MEM path
-// (measured 2026-08-11: the Linux TUN P16 collapse, 0.9 Gbit/s at 380% CPU
-// against 7+ Gbit/s at 4 flows). 16384 puts realistic flow counts well
-// inside the pool; beyond it the pressure-queue wakeups in the Rust port
-// degrade throughput gracefully instead of starving streams. The pool is a
-// static BSS array of ~30-byte entries (~500 KiB), untouched pages stay
-// clean.
+// Desktop tcp_write(COPY) payloads go through libc malloc instead of lwIP's
+// own heap. mem.c's mem_malloc is a first-fit scan from `lfree` across
+// every heap block; at 16 interleaved bulk flows (~4k live payload blocks
+// at ~340k allocs/s) that scan became the CPU sink behind the Linux TUN
+// P16 producer collapse — 0.84 Gbit/s at 251% CPU against sing-box's 6.2,
+// independent of worker count. Switching the heap to libc malloc lifted
+// download f16 to 7.5-10.0 Gbit/s on the same harness (2026-08-11); RSS
+// peaked ~5 MB higher. Mobile keeps mem.c as a hard memory cap.
+#define MEM_LIBC_MALLOC 1
+// 16 bulk flows * 256-MSS send buffers consume 4096 segments nominally —
+// the previous pool size exactly, with zero slack — and partial segments
+// (tcp_output interleaving with tcp_write) push demand past it, so every
+// tcp_write at 16 flows lived on the shared-pool ERR_MEM path. 16384 puts
+// realistic flow counts well inside the pool; beyond it the pressure-queue
+// wakeups in the Rust port degrade throughput gracefully instead of
+// starving streams. The pool is a static BSS array of ~30-byte entries
+// (~500 KiB); untouched pages stay clean.
 #define MEMP_NUM_TCP_SEG 16384
 #endif
 #define PBUF_POOL_SIZE 512
