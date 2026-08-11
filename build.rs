@@ -95,7 +95,13 @@ fn android_host_profile() -> bool {
     true
 }
 
-fn compile_lwip(android_host_profile: bool) {
+/// Extra symbol-prefixed copies of the whole stack compiled alongside the
+/// primary one. Each copy owns separate globals (pcb lists, pools, timers),
+/// so a process can run up to 1 + PANDA_LWIP_EXTRA_SHARDS fully independent
+/// lwIP instances; how many to activate is the application's runtime choice.
+const PANDA_LWIP_EXTRA_SHARDS: u32 = 3;
+
+fn compile_lwip(android_host_profile: bool, shard: Option<u32>) {
     println!("cargo:rerun-if-changed=src/core");
     println!("cargo:rerun-if-changed=src/include");
     println!("cargo:rerun-if-changed=port");
@@ -149,6 +155,22 @@ fn compile_lwip(android_host_profile: bool) {
     if android_host_profile {
         build.define("PANDA_LWIP_ANDROID_PROFILE", None);
     }
+    if let Some(shard) = shard {
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let rename_header = Path::new(&manifest_dir).join("port/shard_rename.h");
+        let rename_header = rename_header.to_str().unwrap();
+        build.define(
+            "PANDA_LWIP_SHARD_PREFIX",
+            format!("panda_shard{shard}_").as_str(),
+        );
+        // Force-include the rename header ahead of every translation unit so
+        // declarations, definitions, and call sites rename coherently.
+        if build.get_compiler().is_like_msvc() {
+            build.flag(format!("/FI{rename_header}"));
+        } else {
+            build.flag("-include").flag(rename_header);
+        }
+    }
     let target = env::var("TARGET").unwrap();
     if target == "aarch64-apple-tvos-sim" {
         let clang_target = apple_clang_target().unwrap();
@@ -159,11 +181,19 @@ fn compile_lwip(android_host_profile: bool) {
             .flag(&sdk_path_for("appletvsimulator"));
     }
     build.debug(true);
-    build.compile("liblwip.a");
+    match shard {
+        None => build.compile("liblwip.a"),
+        Some(shard) => build.compile(&format!("lwip_shard{shard}")),
+    }
 }
 
 fn generate_lwip_bindings(android_host_profile: bool) {
     println!("cargo:rustc-link-lib=lwip");
+    if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+        // port/sys_arch.c's sys_win_rand calls BCryptGenRandom; Rust std
+        // stopped linking bcrypt.lib itself in 1.75 (moved to ProcessPrng).
+        println!("cargo:rustc-link-lib=bcrypt");
+    }
     println!("cargo:include=src/include");
 
     let sdk_include_path = sdk_include_path();
@@ -201,7 +231,10 @@ fn generate_lwip_bindings(android_host_profile: bool) {
 
 fn main() {
     let android_host_profile = android_host_profile();
-    compile_lwip(android_host_profile);
+    compile_lwip(android_host_profile, None);
+    for shard in 2..=(1 + PANDA_LWIP_EXTRA_SHARDS) {
+        compile_lwip(android_host_profile, Some(shard));
+    }
     generate_lwip_bindings(android_host_profile);
     println!("cargo:rerun-if-changed=build.rs");
 }
