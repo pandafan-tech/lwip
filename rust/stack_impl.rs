@@ -137,6 +137,7 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
 }
 
 pub(crate) fn initialize_lwip() {
+    super::mutex::lock_stats::init_from_env();
     let _guard = LWIP_MUTEX.lock();
     initialize_windows_runtime_config().unwrap_or_else(|error| panic!("{error}"));
     LWIP_INIT.call_once(|| unsafe { lwip_init() });
@@ -165,7 +166,7 @@ pub(crate) fn retry_backpressured_tcp_output() {
         return;
     }
 
-    let _guard = LWIP_MUTEX.lock();
+    let _guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_RETRY);
     let err = unsafe { lwip_rs_retry_tcp_output() };
     if err != err_enum_t_ERR_OK as err_t && !EGRESS_BACKPRESSURED.load(Ordering::Acquire) {
         log::warn!("lwIP deferred TCP output retry failed: {err}");
@@ -281,15 +282,27 @@ impl NetStackImpl {
             .filter(|ms| (1..=1000).contains(ms))
             .unwrap_or(250);
         let timeout_task = tokio::spawn(async move {
+            use super::mutex::lock_stats;
+            let stats_on = lock_stats::ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+            let mut last_report = time::Instant::now();
             loop {
                 {
-                    let _g = LWIP_MUTEX.lock();
+                    let _g = LWIP_MUTEX.lock_at(lock_stats::SITE_TIMER);
                     unsafe { sys_check_timeouts() };
                     // Timer processing frees pool capacity with no per-pcb
                     // callback (FIN_WAIT/TIME_WAIT reaps, retransmit
                     // consolidation, ooseq trimming); writers parked on
                     // shared-pool exhaustion must still see it.
                     unsafe { super::tcp_stream_context::pressure_unpark_all_locked() };
+                }
+                if stats_on {
+                    let elapsed = last_report.elapsed();
+                    if elapsed >= time::Duration::from_secs(5) {
+                        last_report = time::Instant::now();
+                        // stderr, not `log`: the benchmark harness caps the
+                        // log level, and diagnostics must survive that.
+                        eprintln!("{}", lock_stats::drain_report(elapsed.as_secs_f64()));
+                    }
                 }
                 // The guard is released before this await: abort() can only
                 // cancel the task at the await point, so the lock is never
@@ -342,7 +355,7 @@ impl NetStackImpl {
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
-        let guard = LWIP_MUTEX.lock();
+        let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_INPUT);
         for item in items {
             if item.is_empty() {
                 continue;

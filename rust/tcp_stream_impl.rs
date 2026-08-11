@@ -229,7 +229,7 @@ impl AsyncRead for TcpStreamImpl {
         // exactly the flow control lwIP should see.
         let read_eof;
         {
-            let guard = LWIP_MUTEX.lock();
+            let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_READ);
             let ctx = &mut *me.callback_ctx.with_lock(&guard);
             if ctx.errored {
                 return Poll::Ready(Err(broken_pipe()));
@@ -344,7 +344,7 @@ impl Drop for TcpStreamImpl {
 
 impl AsyncWrite for TcpStreamImpl {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let guard = LWIP_MUTEX.lock();
+        let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_WRITE);
         let ctx = &mut *self.callback_ctx.with_lock(&guard);
         if ctx.errored {
             return Poll::Ready(Err(broken_pipe()));
@@ -396,7 +396,7 @@ impl AsyncWrite for TcpStreamImpl {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        let guard = LWIP_MUTEX.lock();
+        let guard = LWIP_MUTEX.lock_at(super::mutex::lock_stats::SITE_FLUSH);
         if self.callback_ctx.with_lock(&guard).errored {
             return Poll::Ready(Err(broken_pipe()));
         }
