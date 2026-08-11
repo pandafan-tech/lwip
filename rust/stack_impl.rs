@@ -136,7 +136,7 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
     Ok(())
 }
 
-fn initialize_lwip() {
+pub(crate) fn initialize_lwip() {
     let _guard = LWIP_MUTEX.lock();
     initialize_windows_runtime_config().unwrap_or_else(|error| panic!("{error}"));
     LWIP_INIT.call_once(|| unsafe { lwip_init() });
@@ -271,6 +271,11 @@ impl NetStackImpl {
                 {
                     let _g = LWIP_MUTEX.lock();
                     unsafe { sys_check_timeouts() };
+                    // Timer processing frees pool capacity with no per-pcb
+                    // callback (FIN_WAIT/TIME_WAIT reaps, retransmit
+                    // consolidation, ooseq trimming); writers parked on
+                    // shared-pool exhaustion must still see it.
+                    unsafe { super::tcp_stream_context::pressure_unpark_all_locked() };
                 }
                 // The guard is released before this await: abort() can only
                 // cancel the task at the await point, so the lock is never

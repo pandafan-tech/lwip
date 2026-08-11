@@ -6,7 +6,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::lwip::*;
 use super::packet::PacketPool;
-use super::tcp_stream_context::{ActiveTcpStream, QueuedTcpPacket, TcpStreamContext};
+use super::tcp_stream_context::{
+    pressure_park_locked, pressure_remove_locked, pressure_unpark_all_locked,
+    pressure_unpark_one_locked, ActiveTcpStream, QueuedTcpPacket, TcpStreamContext,
+};
 use super::util;
 use super::LWIP_MUTEX;
 
@@ -74,11 +77,17 @@ pub extern "C" fn tcp_sent_cb(arg: *mut raw::c_void, tpcb: *mut tcp_pcb, len: u1
     // SAFETY: tcp_sent_cb is called from tcp_input only when
     // an ACK packet is received. Thus lwip_mutex must be locked.
     // See also `<NetStackImpl as AsyncWrite>::poll_write`.
-    let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
-    // trace!("netstack tcp sent {}", &ctx.local_addr);
-    if let Some(waker) = ctx.write_waker.take() {
-        waker.wake();
+    {
+        let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
+        // trace!("netstack tcp sent {}", &ctx.local_addr);
+        if let Some(waker) = ctx.write_waker.take() {
+            waker.wake();
+        }
     }
+    // tcp_input freed this ACK's segments (and their payload memory) before
+    // invoking us; hand the capacity to a writer parked on pool exhaustion.
+    // The own-context borrow is dropped above: unpark walks foreign contexts.
+    unsafe { pressure_unpark_one_locked() };
     err_enum_t_ERR_OK as err_t
 }
 
@@ -87,15 +96,23 @@ pub extern "C" fn tcp_err_cb(arg: *mut ::std::os::raw::c_void, err: err_t) {
     // SAFETY: tcp_err_cb is called from
     // tcp_input, tcp_abandon, tcp_abort, tcp_alloc and tcp_new.
     // Thus lwip_mutex must be locked before calling any of these.
-    let ctx = &mut *unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
-    trace!("netstack tcp err {} {}", err, ctx.local_addr);
-    ctx.errored = true;
-    if let Some(waker) = ctx.read_waker.take() {
-        waker.wake();
+    {
+        let mut ctx = unsafe { TcpStreamContext::assume_locked(arg as *const TcpStreamContext) };
+        trace!("netstack tcp err {} {}", err, ctx.local_addr);
+        ctx.errored = true;
+        // An errored stream is done writing; a stale pressure entry must not
+        // swallow an unpark meant for a live writer.
+        unsafe { pressure_remove_locked(arg as *const TcpStreamContext, &mut ctx) };
+        if let Some(waker) = ctx.read_waker.take() {
+            waker.wake();
+        }
+        if let Some(waker) = ctx.write_waker.take() {
+            waker.wake();
+        }
     }
-    if let Some(waker) = ctx.write_waker.take() {
-        waker.wake();
-    }
+    // lwIP freed the pcb and everything it had queued before invoking us;
+    // that bulk capacity can unblock every parked writer.
+    unsafe { pressure_unpark_all_locked() };
 }
 
 #[allow(unused_variables)]
@@ -278,33 +295,45 @@ impl AsyncRead for TcpStreamImpl {
 impl Drop for TcpStreamImpl {
     fn drop(&mut self) {
         let guard = LWIP_MUTEX.lock();
-        let ctx = &*self.callback_ctx.with_lock(&guard);
-        trace!("netstack tcp drop {}", ctx.local_addr);
-        if !ctx.errored {
+        {
+            let mut ctx = self.callback_ctx.with_lock(&guard);
+            trace!("netstack tcp drop {}", ctx.local_addr);
+            // The context is about to be freed with the stream; it must leave
+            // the pressure queue while the pointer is still valid.
             unsafe {
-                tcp_arg(self.pcb as *mut tcp_pcb, std::ptr::null_mut());
-                tcp_recv(self.pcb as *mut tcp_pcb, None);
-                tcp_sent(self.pcb as *mut tcp_pcb, None);
-                tcp_err(self.pcb as *mut tcp_pcb, None);
-                tcp_poll(self.pcb as *mut tcp_pcb, None, 0);
-                if !ctx.closed {
-                    tcp_abort(self.pcb as *mut tcp_pcb);
-                } else {
-                    // poll_shutdown already half-closed TX (tcp_shutdown rx=0
-                    // tx=1), so the pcb is in FIN_WAIT_1/2 awaiting the peer's
-                    // FIN. Without TF_RXCLOSED, lwIP's slowtmr never reaps a
-                    // FIN_WAIT_2 pcb — a peer that vanishes without FINing
-                    // (suspended iOS app, dead link) leaks the pcb plus its
-                    // unacked segments forever. tcp_close on an already
-                    // TX-shut pcb just sets TF_RXCLOSED, enabling the
-                    // TCP_FIN_WAIT_TIMEOUT (20 s) reap; it frees nothing we
-                    // still reference. Fall back to abort if it errors.
-                    if tcp_close(self.pcb as *mut tcp_pcb) != err_enum_t_ERR_OK as err_t {
+                pressure_remove_locked(&self.callback_ctx as *const _, &mut ctx);
+            }
+            if !ctx.errored {
+                unsafe {
+                    tcp_arg(self.pcb as *mut tcp_pcb, std::ptr::null_mut());
+                    tcp_recv(self.pcb as *mut tcp_pcb, None);
+                    tcp_sent(self.pcb as *mut tcp_pcb, None);
+                    tcp_err(self.pcb as *mut tcp_pcb, None);
+                    tcp_poll(self.pcb as *mut tcp_pcb, None, 0);
+                    if !ctx.closed {
                         tcp_abort(self.pcb as *mut tcp_pcb);
+                    } else {
+                        // poll_shutdown already half-closed TX (tcp_shutdown
+                        // rx=0 tx=1), so the pcb is in FIN_WAIT_1/2 awaiting
+                        // the peer's FIN. Without TF_RXCLOSED, lwIP's slowtmr
+                        // never reaps a FIN_WAIT_2 pcb — a peer that vanishes
+                        // without FINing (suspended iOS app, dead link) leaks
+                        // the pcb plus its unacked segments forever. tcp_close
+                        // on an already TX-shut pcb just sets TF_RXCLOSED,
+                        // enabling the TCP_FIN_WAIT_TIMEOUT (20 s) reap; it
+                        // frees nothing we still reference. Fall back to abort
+                        // if it errors.
+                        if tcp_close(self.pcb as *mut tcp_pcb) != err_enum_t_ERR_OK as err_t {
+                            tcp_abort(self.pcb as *mut tcp_pcb);
+                        }
                     }
                 }
             }
         }
+        // The abort above returned the pcb's queued segments and payload
+        // memory to the shared pools; that bulk capacity can unblock every
+        // parked writer. The own-context borrow ended with the scope.
+        unsafe { pressure_unpark_all_locked() };
     }
 }
 
@@ -345,8 +374,13 @@ impl AsyncWrite for TcpStreamImpl {
             }
             Poll::Ready(Ok(to_write))
         } else if err == err_enum_t_ERR_MEM as err_t {
-            // trace!("netstack tcp err_mem on {}", &local_addr);
+            // ERR_MEM while send-buffer space remains means a shared pool
+            // (MEMP_TCP_SEG or the lwIP heap) is exhausted — usually by other
+            // connections, whose frees never invoke this pcb's callbacks.
+            // Park on the global pressure queue so freed capacity wakes this
+            // writer instead of leaving it to the 4-second tcp_poll fallback.
             ctx.write_waker.replace(cx.waker().clone());
+            unsafe { pressure_park_locked(&self.callback_ctx as *const _, ctx) };
             Poll::Pending
         } else {
             Poll::Ready(Err(io::Error::new(
@@ -363,13 +397,17 @@ impl AsyncWrite for TcpStreamImpl {
         }
         let err = unsafe { tcp_output(self.pcb as *mut tcp_pcb) };
         if err != err_enum_t_ERR_OK as err_t {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("netstack tcp_output error {}", err),
-            )))
-        } else {
-            Poll::Ready(Ok(()))
+            // Transmission deferrals, not stream errors: pool exhaustion,
+            // egress-channel backpressure (the netif output hook returns
+            // ERR_MEM when the channel is full), or a route lost during
+            // teardown. The bytes are already queued on the pcb and lwIP
+            // retries them from its ACK/timer paths — poll_write treats the
+            // identical condition the same way. Surfacing an error here made
+            // relays abort healthy connections exactly when the stack was
+            // busiest; fatal states arrive via tcp_err_cb instead.
+            debug!("netstack tcp_output deferred in flush: {err}");
         }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
@@ -395,6 +433,7 @@ impl AsyncWrite for TcpStreamImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stack_impl::LWIP_TEST_LOCK;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
 
@@ -408,6 +447,189 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Drains the shared MEMP_TCP_SEG pool and returns every slot on drop,
+    /// so a failing assertion cannot leak an exhausted pool into the tests
+    /// that run after it.
+    struct SegPoolHoard(Vec<*mut raw::c_void>);
+
+    impl SegPoolHoard {
+        fn exhaust() -> Self {
+            let _guard = LWIP_MUTEX.lock();
+            let mut slots = Vec::new();
+            loop {
+                let seg = unsafe { memp_malloc(memp_t_MEMP_TCP_SEG) };
+                if seg.is_null() {
+                    break;
+                }
+                slots.push(seg);
+            }
+            assert_eq!(
+                slots.len(),
+                MEMP_NUM_TCP_SEG as usize,
+                "the whole compiled segment pool must be hoardable"
+            );
+            Self(slots)
+        }
+
+        fn release_one(&mut self) {
+            let _guard = LWIP_MUTEX.lock();
+            let seg = self.0.pop().expect("hoard is empty");
+            unsafe { memp_free(memp_t_MEMP_TCP_SEG, seg) };
+        }
+    }
+
+    impl Drop for SegPoolHoard {
+        fn drop(&mut self) {
+            let _guard = LWIP_MUTEX.lock();
+            for seg in self.0.drain(..) {
+                unsafe { memp_free(memp_t_MEMP_TCP_SEG, seg) };
+            }
+        }
+    }
+
+    unsafe fn fake_established_pcb() -> *mut tcp_pcb {
+        let pcb = tcp_new();
+        assert!(!pcb.is_null(), "TCP PCB pool exhausted");
+        (*pcb).state = tcp_state_ESTABLISHED;
+        pcb
+    }
+
+    fn counting_waker() -> (Arc<WakeCounter>, Waker) {
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        (counter, waker)
+    }
+
+    /// The P16 collapse repro: a writer that hits ERR_MEM because *other*
+    /// connections exhausted the shared segment pool must be woken by the
+    /// capacity those connections release. The only runtime signal on that
+    /// path is some pcb's sent callback (an ACK freeing segments), so a
+    /// foreign ACK event after a free must reach the parked writer instead
+    /// of leaving it to the 4-second tcp_poll fallback.
+    #[test]
+    fn foreign_ack_wakes_writer_parked_on_shared_pool_exhaustion() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stack_impl::initialize_lwip();
+
+        let mut hoard = SegPoolHoard::exhaust();
+        let mut victim = {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe { TcpStreamImpl::new(fake_established_pcb()) }
+        };
+
+        let (victim_wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let poll = Pin::new(&mut *victim).poll_write(&mut cx, &[0u8; 4096]);
+        assert!(
+            matches!(poll, Poll::Pending),
+            "a write against an exhausted segment pool must park, got {poll:?}"
+        );
+
+        // Another connection's teardown/ACK returns one segment to the pool,
+        // and its sent callback fires — exactly what tcp_input does after
+        // freeing acked segments.
+        hoard.release_one();
+        let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap());
+        {
+            let _guard = LWIP_MUTEX.lock();
+            let foreign_ptr = std::ptr::from_ref(&foreign_ctx).cast_mut().cast();
+            tcp_sent_cb(foreign_ptr, std::ptr::null_mut(), 1);
+        }
+
+        assert_eq!(
+            victim_wakes.0.load(Ordering::Relaxed),
+            1,
+            "the freed capacity never reached the parked writer"
+        );
+    }
+
+    /// A dropped stream must leave the pressure queue before its context is
+    /// freed; a later capacity event must neither crash nor consume a wake
+    /// on the dead entry.
+    #[test]
+    fn drop_removes_the_stream_from_the_pressure_queue() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stack_impl::initialize_lwip();
+
+        let _hoard = SegPoolHoard::exhaust();
+        let mut victim = {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe { TcpStreamImpl::new(fake_established_pcb()) }
+        };
+
+        let (_victim_wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let poll = Pin::new(&mut *victim).poll_write(&mut cx, &[0u8; 4096]);
+        assert!(matches!(poll, Poll::Pending));
+        {
+            let _guard = LWIP_MUTEX.lock();
+            assert_eq!(unsafe { crate::tcp_stream_context::pressure_queue_len_locked() }, 1);
+        }
+
+        drop(victim);
+        {
+            let _guard = LWIP_MUTEX.lock();
+            assert_eq!(unsafe { crate::tcp_stream_context::pressure_queue_len_locked() }, 0);
+        }
+
+        let foreign_ctx = TcpStreamContext::new("127.0.0.1:9999".parse().unwrap());
+        {
+            let _guard = LWIP_MUTEX.lock();
+            let foreign_ptr = std::ptr::from_ref(&foreign_ctx).cast_mut().cast();
+            tcp_sent_cb(foreign_ptr, std::ptr::null_mut(), 1);
+        }
+    }
+
+    /// tcp_output failures during flush are transmission deferrals — the
+    /// bytes are already queued on the pcb and lwIP retries them from its
+    /// ACK/timer paths (poll_write already treats the same condition that
+    /// way). Fatal connection states arrive via tcp_err_cb, never here.
+    #[test]
+    fn poll_flush_defers_transient_output_errors() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stack_impl::initialize_lwip();
+
+        struct NetifListRestore(*mut netif);
+        impl Drop for NetifListRestore {
+            fn drop(&mut self) {
+                let _guard = LWIP_MUTEX.lock();
+                unsafe { netif_list = self.0 };
+            }
+        }
+
+        let mut stream = {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe { TcpStreamImpl::new(fake_established_pcb()) }
+        };
+
+        let (_, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let wrote = Pin::new(&mut *stream).poll_write(&mut cx, &[0u8; 512]);
+        assert!(matches!(wrote, Poll::Ready(Ok(512))), "got {wrote:?}");
+
+        // Force the transmit attempt itself to fail deterministically: with
+        // no routable netif, tcp_output returns ERR_RTE while the 512 bytes
+        // stay queued on the pcb — the same shape as egress backpressure
+        // (whose netif hook returns ERR_MEM with the segment retained).
+        let _restore = {
+            let _guard = LWIP_MUTEX.lock();
+            let restore = NetifListRestore(unsafe { netif_list });
+            unsafe { netif_list = std::ptr::null_mut() };
+            restore
+        };
+        let flush = Pin::new(&mut *stream).poll_flush(&mut cx);
+        assert!(
+            matches!(flush, Poll::Ready(Ok(()))),
+            "a deferred transmission is not a stream error, got {flush:?}"
+        );
     }
 
     #[test]

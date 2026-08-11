@@ -187,19 +187,38 @@
 #define MEM_SIZE (512 * 1024)
 #else
 // tcp_write(COPY) payloads live in this heap, so the desktop heap must hold
-// several 256*MSS send buffers of in-flight bulk data at once. The heap is
-// BSS: untouched pages stay clean, idle RSS does not grow.
-#define MEM_SIZE (8 * 1024 * 1024)
+// the full MEMP_NUM_TCP_SEG segment pool worth of in-flight bulk data
+// (16384 * ~1.55 KiB ≈ 25 MiB at 1460-byte MSS) plus transient header
+// pbufs. The heap is BSS: untouched pages stay clean, idle RSS does not
+// grow.
+#define MEM_SIZE (32 * 1024 * 1024)
 #endif
 #elif defined(__ANDROID__) || defined(PANDA_LWIP_ANDROID_PROFILE)
 // Mobile budget: keep the Android heap at its validated size; the desktop
 // send-buffer bump above does not apply to this tier either.
 #define MEM_SIZE (2 * 1024 * 1024)
 #else
-#define MEM_SIZE (8 * 1024 * 1024)
+#define MEM_SIZE (32 * 1024 * 1024)
 #endif
 
+#if (defined __APPLE__ && TARGET_OS_IPHONE) || defined(__ANDROID__) || \
+    defined(PANDA_LWIP_ANDROID_PROFILE)
+// Mobile keeps the validated pool; its small per-pcb send buffers (16-64
+// MSS) never sit at the pool boundary the way desktop's do.
 #define MEMP_NUM_TCP_SEG 4096
+#else
+// Desktop: 16 bulk flows * 256-MSS send buffers consume 4096 segments
+// nominally — the previous pool size exactly, with zero slack — and partial
+// segments (tcp_output interleaving with tcp_write) push demand past it, so
+// every tcp_write at 16 flows lived on the shared-pool ERR_MEM path
+// (measured 2026-08-11: the Linux TUN P16 collapse, 0.9 Gbit/s at 380% CPU
+// against 7+ Gbit/s at 4 flows). 16384 puts realistic flow counts well
+// inside the pool; beyond it the pressure-queue wakeups in the Rust port
+// degrade throughput gracefully instead of starving streams. The pool is a
+// static BSS array of ~30-byte entries (~500 KiB), untouched pages stay
+// clean.
+#define MEMP_NUM_TCP_SEG 16384
+#endif
 #define PBUF_POOL_SIZE 512
 
 // #define TCP_MSS 1460
