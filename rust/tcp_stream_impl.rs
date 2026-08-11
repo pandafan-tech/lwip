@@ -137,6 +137,10 @@ pub struct TcpStreamImpl {
     // stack's input path for the duration, which on a preemption-prone host
     // is what feeds the spin-yield contention storm.
     staged: std::collections::VecDeque<QueuedTcpPacket>,
+    // Bytes copied out to the reader whose tcp_recved window credit has not
+    // been granted yet; flushed at the start of the next poll_read's locked
+    // phase. Owned by the single reader task, so no lock guards it.
+    pending_recved: usize,
     callback_ctx: TcpStreamContext,
     _active: ActiveTcpStream,
 }
@@ -167,7 +171,8 @@ impl TcpStreamImpl {
                 dest_addr,
                 pcb: pcb as usize,
                 read_buf: None,
-            staged: std::collections::VecDeque::new(),
+                staged: std::collections::VecDeque::new(),
+                pending_recved: 0,
                 callback_ctx: TcpStreamContext::new(src_addr),
                 _active: ActiveTcpStream::new(),
             });
@@ -214,14 +219,27 @@ impl AsyncRead for TcpStreamImpl {
     ) -> Poll<io::Result<()>> {
         let me = &mut *self;
 
-        // Locked phase one: claim everything queued, register the waker if
-        // there is nothing to deliver. No copying happens under the lock.
+        // Locked phase one: flush the receive-window credit from the previous
+        // poll, claim everything queued, and register the waker if there is
+        // nothing to deliver. No copying happens under the lock. Folding
+        // tcp_recved into this tenure (instead of a dedicated post-copy lock)
+        // halves the reader's lock entries; the window opens one poll later,
+        // which a 256-MSS receive window never notices, and a reader that
+        // stalls on upstream backpressure keeps the window closed — which is
+        // exactly the flow control lwIP should see.
         let read_eof;
         {
             let guard = LWIP_MUTEX.lock();
             let ctx = &mut *me.callback_ctx.with_lock(&guard);
             if ctx.errored {
                 return Poll::Ready(Err(broken_pipe()));
+            }
+            while me.pending_recved > 0 {
+                let acknowledged = me.pending_recved.min(usize::from(u16::MAX));
+                unsafe {
+                    tcp_recved(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
+                }
+                me.pending_recved -= acknowledged;
             }
             while let Some(data) = ctx.read_queue.pop_front() {
                 me.staged.push_back(data);
@@ -271,22 +289,9 @@ impl AsyncRead for TcpStreamImpl {
             }
         };
 
-        // Locked phase two: open the lwIP receive window for what was copied.
-        // The pcb may have died while the lock was released, so re-check.
-        if consumed > 0 {
-            let guard = LWIP_MUTEX.lock();
-            let ctx = &*me.callback_ctx.with_lock(&guard);
-            if !ctx.errored {
-                let mut unacknowledged = consumed;
-                while unacknowledged > 0 {
-                    let acknowledged = unacknowledged.min(u16::MAX as usize);
-                    unsafe {
-                        tcp_recved(me.pcb as *mut tcp_pcb, acknowledged as u16_t);
-                    }
-                    unacknowledged -= acknowledged;
-                }
-            }
-        }
+        // The receive-window credit for these bytes is granted during the
+        // next poll's locked phase; phase one re-checks pcb liveness first.
+        me.pending_recved += consumed;
 
         result
     }
@@ -656,5 +661,68 @@ mod tests {
         assert!(unsafe { TcpStreamContext::assume_locked(&context) }
             .write_waker
             .is_none());
+    }
+
+    /// The receive-window credit for delivered bytes is granted during the
+    /// NEXT poll's locked phase instead of a dedicated post-copy lock; the
+    /// deferral must neither leak credit nor grant it early.
+    #[test]
+    fn read_window_credit_is_granted_on_the_next_poll() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stack_impl::initialize_lwip();
+
+        let (mut stream, pcb) = {
+            let _guard = LWIP_MUTEX.lock();
+            let pcb = unsafe { fake_established_pcb() };
+            (TcpStreamImpl::new(pcb), pcb)
+        };
+
+        let wnd_start = {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe {
+                // Deliver 2000 bytes the way tcp_input does, shrinking the
+                // window as lwIP would have when it accepted the segments.
+                let ctx_ptr = std::ptr::from_ref(&stream.callback_ctx)
+                    .cast_mut()
+                    .cast::<raw::c_void>();
+                for _ in 0..2 {
+                    let p = pbuf_alloc(pbuf_layer_PBUF_RAW, 1000, pbuf_type_PBUF_RAM);
+                    assert!(!p.is_null());
+                    tcp_recv_cb(ctx_ptr, pcb, p, err_enum_t_ERR_OK as err_t);
+                }
+                (*pcb).rcv_wnd -= 2000;
+                (*pcb).rcv_wnd
+            }
+        };
+
+        let (_, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut scratch = [0u8; 4096];
+        let mut read_buf = ReadBuf::new(&mut scratch);
+        let poll = Pin::new(&mut *stream).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(read_buf.filled().len(), 2000);
+        {
+            let _guard = LWIP_MUTEX.lock();
+            assert_eq!(
+                unsafe { (*pcb).rcv_wnd },
+                wnd_start,
+                "credit must not be granted in the same poll"
+            );
+        }
+
+        let mut read_buf = ReadBuf::new(&mut scratch);
+        let poll = Pin::new(&mut *stream).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(poll, Poll::Pending));
+        {
+            let _guard = LWIP_MUTEX.lock();
+            assert_eq!(
+                unsafe { (*pcb).rcv_wnd },
+                wnd_start + 2000,
+                "the next poll's locked phase grants the deferred credit"
+            );
+        }
     }
 }

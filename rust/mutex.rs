@@ -25,6 +25,19 @@ use std::sync::atomic::{AtomicBool, Ordering::*};
 // user space. The spin-then-yield lock stays on every platform; the real
 // contention fixes are shorter critical sections (the poll_read staging
 // change) and fewer lock entries per packet.
+//
+// ALSO MEASURED AND REVERTED (2026-08-11): deferring all callback wakes to
+// the guard's release (steal a wake list under the lock, wake after the
+// release store). The theory was that waking inside the critical section
+// sends the woken task straight into a spin on the still-held mutex — the
+// 7-8% sched_yield convoy in the 16-flow Linux TUN profile. Measured on
+// that exact workload it lost 5-18% throughput at slightly HIGHER CPU:
+// the spinning waiter is a hot standby that takes the lock the moment it
+// is released, so in-tenure wakes pipeline the next tenure, while deferred
+// wakes leave the lock idle for a wake+reschedule round trip between
+// tenures. The yield burn is the price of zero-gap lock handoff, not
+// waste. Do not retry wake deferral wholesale; if the convoy needs
+// shrinking, remove lock *entries* instead.
 
 #[derive(Debug)]
 pub struct AtomicMutex {
