@@ -74,6 +74,12 @@ HDR
             sys_init \
             sys_jiffies \
             sys_win_rand
+        # mem.c's static heap (LWIP_DECLARE_MEMORY_ALIGNED) only exists when
+        # MEM_LIBC_MALLOC=0 — the Android profile. Desktop scan archives use
+        # libc malloc and never export it, so list it explicitly; each shard
+        # must own its heap or their allocators would collide at link time.
+        printf '%s\n' \
+            ram_heap
     } \
         | sort -u \
         | grep -v -x \

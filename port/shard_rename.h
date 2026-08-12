@@ -229,6 +229,7 @@ int lwip_memcmp_consttime(const void *s1, const void *s2, size_t len);
 #define pbuf_take_at PANDA_LWIP_RENAME(pbuf_take_at)
 #define pbuf_try_get_at PANDA_LWIP_RENAME(pbuf_try_get_at)
 #define prefix_list PANDA_LWIP_RENAME(prefix_list)
+#define ram_heap PANDA_LWIP_RENAME(ram_heap)
 #define raw_bind PANDA_LWIP_RENAME(raw_bind)
 #define raw_bind_netif PANDA_LWIP_RENAME(raw_bind_netif)
 #define raw_connect PANDA_LWIP_RENAME(raw_connect)
