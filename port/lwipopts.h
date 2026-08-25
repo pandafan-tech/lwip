@@ -231,8 +231,17 @@
 // heap-on-demand (MEM_LIBC_MALLOC), not a static allocation.
 #define TCP_SND_BUF (512 * PANDA_BASE_TCP_MSS)
 #else
-#define TCP_WND (256 * PANDA_BASE_TCP_MSS)
-#define TCP_SND_BUF (256 * PANDA_BASE_TCP_MSS)
+// macOS/Linux desktop: the 2026-08-25 loopback TUN bench measured single
+// streams plateauing at ~22 Gbit/s with the historical 256-MSS budgets —
+// exactly 373 KiB divided by the ~130 us path RTT, i.e. window-bound. Lift
+// macOS to the validated Windows tier: 2872-MSS compiled window ceiling,
+// 512-MSS active window and send buffer (747 KiB in flight each way).
+// Budgets are heap-on-demand on desktop (MEM_LIBC_MALLOC); raising them
+// costs nothing until a flow actually fills the pipe.
+#define TCP_WND (2872 * PANDA_BASE_TCP_MSS)
+#define TCP_WND_RUNTIME_DEFAULT (512 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (512 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF_RUNTIME_DEFAULT (512 * PANDA_BASE_TCP_MSS)
 #endif
 // Sized for the smallest runtime MSS (see PANDA_MIN_EFF_TCP_MSS): a full
 // send buffer at MSS 536 needs ~698 segments and interleaved partial
