@@ -148,6 +148,12 @@
 #define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_BUF_RUNTIME_DEFAULT (16 * PANDA_BASE_TCP_MSS)
 #define TCP_SND_BUF_RUNTIME_MIN (4 * PANDA_BASE_TCP_MSS)
+// The upstream default derives this from the compile-time TCP_WND; pin it
+// to the runtime-default window so raising only the ceiling keeps the
+// historical explicit-window-update cadence (a larger threshold would
+// delay reopening announcements at the unchanged 32-MSS active window).
+#define TCP_WND_UPDATE_THRESHOLD \
+  LWIP_MIN((TCP_WND_RUNTIME_DEFAULT / 4), (TCP_MSS * 4))
 // TCP_MSS is compiled for a possible 9000-byte desktop TUN, but mobile runs
 // at 1500 MTU. The lwIP default derives this queue from the oversized compile
 // MSS and cannot represent one full Rust write, causing tcp_write(ERR_MEM) to
