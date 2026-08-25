@@ -1316,6 +1316,23 @@
 #endif
 
 /**
+ * TCP_SND_BUF_RUNTIME_DEFAULT: Initial active send buffer for new PCBs.
+ * TCP_SND_BUF remains the compile-time upper bound (and keeps sizing
+ * TCP_SND_QUEUELEN and the sanity checks).
+ */
+#if !defined TCP_SND_BUF_RUNTIME_DEFAULT || defined __DOXYGEN__
+#define TCP_SND_BUF_RUNTIME_DEFAULT     TCP_SND_BUF
+#endif
+
+/**
+ * TCP_SND_BUF_RUNTIME_MIN: Smallest active send buffer accepted at runtime.
+ * Must stay above TCP_SNDLOWAT or tcp_write admission control wedges.
+ */
+#if !defined TCP_SND_BUF_RUNTIME_MIN || defined __DOXYGEN__
+#define TCP_SND_BUF_RUNTIME_MIN         (TCP_SNDLOWAT + 1)
+#endif
+
+/**
  * TCP_MAXRTX: Maximum number of retransmissions of data segments.
  */
 #if !defined TCP_MAXRTX || defined __DOXYGEN__

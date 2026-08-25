@@ -315,6 +315,7 @@ int lwip_memcmp_consttime(const void *s1, const void *s2, size_t len);
 #define tcp_send_fin PANDA_LWIP_RENAME(tcp_send_fin)
 #define tcp_sent PANDA_LWIP_RENAME(tcp_sent)
 #define tcp_set_wnd_runtime PANDA_LWIP_RENAME(tcp_set_wnd_runtime)
+#define tcp_set_snd_buf_runtime PANDA_LWIP_RENAME(tcp_set_snd_buf_runtime)
 #define tcp_setprio PANDA_LWIP_RENAME(tcp_setprio)
 #define tcp_shutdown PANDA_LWIP_RENAME(tcp_shutdown)
 #define tcp_slowtmr PANDA_LWIP_RENAME(tcp_slowtmr)

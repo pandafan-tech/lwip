@@ -134,10 +134,20 @@
 // ceiling-derived sanity margins matter, and keeping it fixed keeps the
 // mobile memory profile byte-identical.
 #define TCP_MSS 8960
-// Network Extension has a tight process-memory ceiling. Keep the mobile
-// receive/send budget conservative; the device-side TUN RTT is tiny.
-#define TCP_WND (32 * PANDA_BASE_TCP_MSS)
-#define TCP_SND_BUF (16 * PANDA_BASE_TCP_MSS)
+// Network Extension has a tight process-memory ceiling. The ACTIVE budget
+// stays at the historical conservative values via the RUNTIME_DEFAULTs
+// below, so the default memory profile is unchanged; the compile ceilings
+// are the validated Android tier so the app-exposed runtime knobs
+// (resources.lwip-tcp-*-mss) have headroom for throughput testing.
+// Windows/buffers are budgets, not allocations — raising only the ceiling
+// costs no memory until a knob actually uses it.
+#define LWIP_WND_SCALE 1
+#define TCP_RCV_SCALE 2
+#define TCP_WND (128 * PANDA_BASE_TCP_MSS)
+#define TCP_WND_RUNTIME_DEFAULT (32 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF (64 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF_RUNTIME_DEFAULT (16 * PANDA_BASE_TCP_MSS)
+#define TCP_SND_BUF_RUNTIME_MIN (4 * PANDA_BASE_TCP_MSS)
 // TCP_MSS is compiled for a possible 9000-byte desktop TUN, but mobile runs
 // at 1500 MTU. The lwIP default derives this queue from the oversized compile
 // MSS and cannot represent one full Rust write, causing tcp_write(ERR_MEM) to
@@ -236,8 +246,11 @@
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 // The fixed lwIP heap is a deliberate hard cap on the Network Extension's
-// TCP payload memory (jetsam budget); mobile stays on mem.c.
-#define MEM_SIZE (512 * 1024)
+// TCP payload memory (jetsam budget); mobile stays on mem.c. 2 MiB matches
+// the validated Android tier and covers the raised window/send-buffer
+// ceilings; the heap is a BSS array, so pages the default-budget workload
+// never touches stay clean and do not move the jetsam footprint.
+#define MEM_SIZE (2 * 1024 * 1024)
 #endif
 #elif defined(__ANDROID__) || defined(PANDA_LWIP_ANDROID_PROFILE)
 // Mobile budget: keep the Android heap at its validated size.

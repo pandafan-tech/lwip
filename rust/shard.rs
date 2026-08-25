@@ -42,6 +42,7 @@ macro_rules! with_shard_api {
             lwip_rs_retry_tcp_output: fn() -> err_t,
             lwip_rs_set_tcp_tx_partial_checksum: fn(::std::os::raw::c_int),
             tcp_set_wnd_runtime: fn(tcpwnd_size_t) -> err_t,
+            tcp_set_snd_buf_runtime: fn(tcpwnd_size_t) -> err_t,
             memp_pbuf_pool_set_capacity: fn(u16_t) -> err_t,
             memp_pbuf_pool_get_runtime_stats: fn(*mut memp_pbuf_pool_runtime_stats),
             pbuf_alloced_custom:
@@ -85,8 +86,8 @@ macro_rules! declare_vt_struct {
         /// One shard's entry points into its copy of the C stack. Calling a
         /// pcb/pbuf into the WRONG shard's functions corrupts both stacks —
         /// every object in the wrapper carries the shard it was born on.
-        // tcp_set_wnd_runtime is only read on windows; the vtable stays
-        // identical across platforms.
+        // Some entries (e.g. the Windows UDP runtime hooks) are only read on
+        // one platform; the vtable stays identical across platforms.
         #[cfg_attr(not(windows), allow(dead_code))]
         pub(crate) struct ShardVt {
             $( pub $name: unsafe extern "C" fn($($arg),*) $(-> $ret)?, )*

@@ -413,6 +413,8 @@ struct tcp_pcb * tcp_new     (void);
 struct tcp_pcb * tcp_new_ip_type (u8_t type);
 /** Set the receive window used by subsequently allocated PCBs. */
 err_t            tcp_set_wnd_runtime(tcpwnd_size_t wnd);
+/** Set the send buffer used by subsequently allocated PCBs. */
+err_t            tcp_set_snd_buf_runtime(tcpwnd_size_t sndbuf);
 
 void             tcp_arg     (struct tcp_pcb *pcb, void *arg);
 #if LWIP_CALLBACK_API

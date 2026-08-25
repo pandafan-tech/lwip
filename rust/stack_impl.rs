@@ -126,6 +126,89 @@ pub fn initialize_windows_runtime_config() -> super::Result<()> {
     Ok(())
 }
 
+/// Runtime TCP budgets requested by the embedding application, in bytes.
+/// Zero means "keep the compiled default". Stored so stacks that
+/// initialize after the call observe the same values.
+static REQUESTED_TCP_RCV_WND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static REQUESTED_TCP_SND_BUF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Configure the TCP receive window and send buffer applied to every
+/// subsequently allocated pcb, in PANDA_BASE_TCP_MSS (1460-byte) units.
+///
+/// `None` keeps the compiled platform default for that knob. Values are
+/// validated against the compiled floors and ceilings; an out-of-range value
+/// returns an error and changes nothing, so callers must surface it rather
+/// than start with a silently different budget. Already-initialized stacks
+/// are updated immediately (existing connections keep their budgets; new
+/// pcbs pick up the change); stacks initialized later apply the stored
+/// values during init. On Windows a value configured here overrides the
+/// PANDA_LWIP_TCP_RCV_WND_MSS environment selection.
+pub fn configure_tcp_tuning(
+    rcv_wnd_mss: Option<u32>,
+    snd_buf_mss: Option<u32>,
+) -> std::result::Result<(), String> {
+    let rcv_wnd = rcv_wnd_mss
+        .map(|mss| {
+            let bytes = mss
+                .checked_mul(PANDA_BASE_TCP_MSS)
+                .filter(|bytes| (TCP_WND_RUNTIME_MIN..=TCP_WND).contains(bytes))
+                .ok_or_else(|| {
+                    format!(
+                        "lwip TCP receive window must be between {} and {} MSS on this platform, got {mss}",
+                        TCP_WND_RUNTIME_MIN.div_ceil(PANDA_BASE_TCP_MSS),
+                        TCP_WND / PANDA_BASE_TCP_MSS
+                    )
+                })?;
+            Ok::<u32, String>(bytes)
+        })
+        .transpose()?;
+    let snd_buf = snd_buf_mss
+        .map(|mss| {
+            let bytes = mss
+                .checked_mul(PANDA_BASE_TCP_MSS)
+                .filter(|bytes| (TCP_SND_BUF_RUNTIME_MIN..=TCP_SND_BUF).contains(bytes))
+                .ok_or_else(|| {
+                    format!(
+                        "lwip TCP send buffer must be between {} and {} MSS on this platform, got {mss}",
+                        TCP_SND_BUF_RUNTIME_MIN.div_ceil(PANDA_BASE_TCP_MSS),
+                        TCP_SND_BUF / PANDA_BASE_TCP_MSS
+                    )
+                })?;
+            Ok::<u32, String>(bytes)
+        })
+        .transpose()?;
+
+    if let Some(bytes) = rcv_wnd {
+        REQUESTED_TCP_RCV_WND.store(bytes, Ordering::Release);
+    }
+    if let Some(bytes) = snd_buf {
+        REQUESTED_TCP_SND_BUF.store(bytes, Ordering::Release);
+    }
+    for shard in super::shard::SHARDS
+        .iter()
+        .filter(|shard| shard.init.is_completed())
+    {
+        let _guard = shard.mutex.lock();
+        if let Some(bytes) = rcv_wnd {
+            let result = unsafe { (shard.vt.tcp_set_wnd_runtime)(bytes) };
+            assert_eq!(
+                result, err_enum_t_ERR_OK as err_t,
+                "shard {} rejected the validated TCP receive window",
+                shard.id
+            );
+        }
+        if let Some(bytes) = snd_buf {
+            let result = unsafe { (shard.vt.tcp_set_snd_buf_runtime)(bytes) };
+            assert_eq!(
+                result, err_enum_t_ERR_OK as err_t,
+                "shard {} rejected the validated TCP send buffer",
+                shard.id
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn initialize_lwip(shard: ShardRef) {
     super::mutex::lock_stats::init_from_env();
     if std::env::var_os("PANDA_LWIP_ZEROCOPY_EGRESS").is_some() {
@@ -143,6 +226,27 @@ pub(crate) fn initialize_lwip(shard: ShardRef) {
             assert_eq!(
                 result, err_enum_t_ERR_OK as err_t,
                 "shard {} rejected the validated TCP receive window",
+                shard.id
+            );
+        }
+        // Application-configured budgets (configure_tcp_tuning) were
+        // validated at store time; they intentionally land after the
+        // Windows environment value so an explicit configuration wins.
+        let requested_rcv_wnd = REQUESTED_TCP_RCV_WND.load(Ordering::Acquire);
+        if requested_rcv_wnd != 0 {
+            let result = (shard.vt.tcp_set_wnd_runtime)(requested_rcv_wnd);
+            assert_eq!(
+                result, err_enum_t_ERR_OK as err_t,
+                "shard {} rejected the validated TCP receive window",
+                shard.id
+            );
+        }
+        let requested_snd_buf = REQUESTED_TCP_SND_BUF.load(Ordering::Acquire);
+        if requested_snd_buf != 0 {
+            let result = (shard.vt.tcp_set_snd_buf_runtime)(requested_snd_buf);
+            assert_eq!(
+                result, err_enum_t_ERR_OK as err_t,
+                "shard {} rejected the validated TCP send buffer",
                 shard.id
             );
         }
@@ -841,6 +945,61 @@ mod tests {
             assert_ne!((*pcb).rcv_wnd, TCP_WND);
 
             tcp_abort(pcb);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn configure_tcp_tuning_rejects_out_of_range_values_without_storing() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let max_rcv_mss = TCP_WND / PANDA_BASE_TCP_MSS;
+        let max_snd_mss = TCP_SND_BUF / PANDA_BASE_TCP_MSS;
+        assert!(configure_tcp_tuning(Some(1), None).is_err());
+        assert!(configure_tcp_tuning(Some(max_rcv_mss + 1), None).is_err());
+        assert!(configure_tcp_tuning(None, Some(1)).is_err());
+        assert!(configure_tcp_tuning(None, Some(max_snd_mss + 1)).is_err());
+        // A rejected value must leave the stored request untouched, or a
+        // later stack init would apply a budget the caller was told failed.
+        assert_eq!(REQUESTED_TCP_RCV_WND.load(Ordering::Acquire), 0);
+        assert_eq!(REQUESTED_TCP_SND_BUF.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn configure_tcp_tuning_send_buffer_reaches_new_pcbs() {
+        let _test_guard = LWIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        initialize_lwip(primary());
+
+        let requested_mss = 8;
+        configure_tcp_tuning(None, Some(requested_mss)).expect("8 MSS is inside every platform tier");
+        {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe {
+                let pcb = tcp_new();
+                assert!(!pcb.is_null());
+                assert_eq!((*pcb).snd_buf, requested_mss * PANDA_BASE_TCP_MSS);
+                tcp_abort(pcb);
+            }
+        }
+
+        REQUESTED_TCP_SND_BUF.store(0, Ordering::Release);
+        {
+            let _guard = LWIP_MUTEX.lock();
+            unsafe {
+                assert_eq!(
+                    tcp_set_snd_buf_runtime(TCP_SND_BUF_RUNTIME_DEFAULT),
+                    err_enum_t_ERR_OK as err_t
+                );
+                let pcb = tcp_new();
+                assert!(!pcb.is_null());
+                assert_eq!((*pcb).snd_buf, TCP_SND_BUF_RUNTIME_DEFAULT);
+                tcp_abort(pcb);
+            }
         }
     }
 }

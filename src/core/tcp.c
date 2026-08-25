@@ -160,6 +160,7 @@ static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
 
 /* Active receive window. It must be configured before allocating TCP PCBs. */
 static tcpwnd_size_t tcp_wnd_runtime = TCP_WND_RUNTIME_DEFAULT;
+static tcpwnd_size_t tcp_snd_buf_runtime = TCP_SND_BUF_RUNTIME_DEFAULT;
 
 /* Incremented every coarse grained timer shot (typically every 500 ms). */
 u32_t tcp_ticks;
@@ -215,6 +216,16 @@ tcp_set_wnd_runtime(tcpwnd_size_t wnd)
     return ERR_VAL;
   }
   tcp_wnd_runtime = wnd;
+  return ERR_OK;
+}
+
+err_t
+tcp_set_snd_buf_runtime(tcpwnd_size_t sndbuf)
+{
+  if ((sndbuf < TCP_SND_BUF_RUNTIME_MIN) || (sndbuf > TCP_SND_BUF)) {
+    return ERR_VAL;
+  }
+  tcp_snd_buf_runtime = sndbuf;
   return ERR_OK;
 }
 
@@ -1913,7 +1924,7 @@ tcp_alloc(u8_t prio)
     /* zero out the whole pcb, so there is no need to initialize members to zero */
     memset(pcb, 0, sizeof(struct tcp_pcb));
     pcb->prio = prio;
-    pcb->snd_buf = TCP_SND_BUF;
+    pcb->snd_buf = tcp_snd_buf_runtime;
     pcb->rcv_wnd_max = tcp_wnd_runtime;
     /* Start with a window that does not need scaling. When window scaling is
        enabled and used, the window is enlarged when both sides agree on scaling. */
