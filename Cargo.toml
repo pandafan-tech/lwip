@@ -18,6 +18,9 @@ path = "rust/lib.rs"
 [dependencies]
 bytes = "1"
 crossbeam-queue = "0.3"
+# Desktop spin-then-park lock escalation (rust/mutex.rs): parked waiters for
+# long lwIP tenures instead of unbounded yield-spinning.
+parking_lot_core = "0.9"
 futures = "0.3"
 log = "0.4"
 thiserror = "1"

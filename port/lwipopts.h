@@ -306,6 +306,17 @@
 // #define MEM_LIBC_MALLOC 1
 // #define MEMP_MEM_MALLOC 1
 
+// Latent since the port's beginning and exposed 2026-08-29: MEM_ALIGNMENT
+// was never set, so it defaulted to 1 — every static MEMP pool array was
+// only byte-aligned and element pointers (tcp_pcb, tcp_seg, ...) landed
+// wherever the linker happened to place the array. ARM64 tolerates the
+// resulting unaligned loads, which masked the bug until an unrelated BSS
+// addition shifted layout and put the TCP_PCB pool on an odd address
+// (Rust-side debug alignment checks then caught it). 8 matches the
+// pointer-heavy element types on every shipped 64-bit target and makes the
+// declared pool arrays genuinely aligned.
+#define MEM_ALIGNMENT 8
+
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS
 

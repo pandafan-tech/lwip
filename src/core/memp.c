@@ -111,6 +111,36 @@ memp_is_pbuf_pool(const struct memp_desc *desc)
   return desc == memp_pools[MEMP_PBUF_POOL];
 }
 
+#if !MEMP_MEM_MALLOC && !MEMP_OVERFLOW_CHECK && !MEMP_MEM_INIT && !MEMP_STATS
+/* Lazy free-list carving (2026-08-29): the eager free-list build writes to
+ * every element of every pool at init, dirtying pages the process may never
+ * use — with the 15640-byte desktop MSS the PBUF_POOL alone is ~8 MiB per
+ * stack shard, and four shards idled ~30 MiB above the single-stack
+ * profile. Standard pools therefore start with an EMPTY free list plus a
+ * carve cursor: allocation prefers the free list (returned elements) and
+ * otherwise carves the next untouched element from the backing array, so a
+ * page is dirtied the first time its element is actually needed. Custom
+ * pools, stats builds, and sanity builds (MEMP_STATS /
+ * MEMP_OVERFLOW_CHECK / MEMP_MEM_INIT) keep the eager build, whose
+ * init-time element writes those features rely on. */
+#define MEMP_LAZY_CARVE 1
+static u16_t memp_lazy_carved[MEMP_MAX];
+
+static int
+memp_std_pool_index(const struct memp_desc *desc)
+{
+  int i;
+  for (i = 0; i < (int)LWIP_ARRAYSIZE(memp_pools); i++) {
+    if (memp_pools[i] == desc) {
+      return i;
+    }
+  }
+  return -1;
+}
+#else
+#define MEMP_LAZY_CARVE 0
+#endif
+
 #if !MEMP_MEM_MALLOC
 static u16_t
 memp_pool_effective_num(const struct memp_desc *desc)
@@ -268,6 +298,17 @@ memp_init_pool(const struct memp_desc *desc)
   num = memp_pool_effective_num(desc);
 
   *desc->tab = NULL;
+#if MEMP_LAZY_CARVE
+  {
+    int idx = memp_std_pool_index(desc);
+    if (idx >= 0) {
+      /* Standard pool: leave the backing array untouched and let
+       * do_memp_malloc_pool carve elements on demand. */
+      memp_lazy_carved[idx] = 0;
+      return;
+    }
+  }
+#endif
   memp = (struct memp *)LWIP_MEM_ALIGN(desc->base);
 #if MEMP_MEM_INIT
   /* force memset on pool memory */
@@ -346,6 +387,18 @@ do_memp_malloc_pool_fn(const struct memp_desc *desc, const char *file, const int
   SYS_ARCH_PROTECT(old_level);
 
   memp = *desc->tab;
+#if MEMP_LAZY_CARVE
+  if (memp == NULL) {
+    int idx = memp_std_pool_index(desc);
+    if (idx >= 0 && memp_lazy_carved[idx] < memp_pool_effective_num(desc)) {
+      memp = (struct memp *)(void *)((u8_t *)LWIP_MEM_ALIGN(desc->base) +
+                                     (size_t)memp_lazy_carved[idx] *
+                                         (MEMP_SIZE + desc->size));
+      memp->next = *desc->tab; /* == NULL; makes the pop below a no-op */
+      memp_lazy_carved[idx]++;
+    }
+  }
+#endif /* MEMP_LAZY_CARVE */
 #endif /* MEMP_MEM_MALLOC */
 
   if (memp != NULL) {

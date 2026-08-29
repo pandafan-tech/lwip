@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::*};
 use std::time::Instant;
 
 // NOTE (regression revert 2026-06-15): this lock was briefly switched to a
@@ -133,6 +133,69 @@ pub mod lock_stats {
     }
 }
 
+// Spin-then-park escalation (2026-08-29). The pure spin-then-yield wait
+// loop was measured burning ~2.0 of 4.3 total cores on the 16-flow MTU-1500
+// download (lock-stats: util 2.51 with wait_total ~9.9 s per 5 s window)
+// once the 15640-MSS relay writes stretched tenures to ~26 µs — the
+// yield-spin price scales with tenure length, and the three historical
+// anti-parking verdicts above were all measured in the 4-6 µs-tenure,
+// single-global-lock era. The hybrid keeps their lessons: the fast path is
+// exactly the old CAS, short tenures still hand off through the bounded
+// spin/yield phase with zero-gap pipelining, and only waits that outlive
+// that budget park on a futex-class queue (parking_lot_core), freeing the
+// worker for other tasks. Mobile keeps the pure spin-then-yield loop: the
+// iOS packet-tunnel livelock note above is about parked workers on a tiny
+// runtime, and nothing was re-measured there. `PANDA_LWIP_LOCK_PARK=0` is
+// the desktop escape hatch back to the old behavior.
+const LOCK_SPIN_BUDGET: u32 = 64;
+const LOCK_YIELD_BUDGET: u32 = 16;
+
+const PARK_SUPPORTED: bool = cfg!(not(any(
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "android"
+)));
+
+/// Runtime switch for the park escalation, resolved once at stack
+/// initialization (`lock_stats::init_from_env` timing). Defaults to the
+/// platform gate; `PANDA_LWIP_LOCK_PARK=0`/`1` overrides on supported
+/// platforms, and any other value fails loud at parse time.
+pub(crate) static PARK_ENABLED: AtomicBool = AtomicBool::new(PARK_SUPPORTED);
+
+pub(crate) fn init_park_from_env() -> Result<(), String> {
+    let Some(raw) = std::env::var_os("PANDA_LWIP_LOCK_PARK") else {
+        return Ok(());
+    };
+    match raw.to_str() {
+        Some("1") => {
+            if !PARK_SUPPORTED {
+                return Err(
+                    "PANDA_LWIP_LOCK_PARK=1 is not supported on mobile packet tunnels".to_owned(),
+                );
+            }
+            PARK_ENABLED.store(true, Relaxed);
+            Ok(())
+        }
+        Some("0") => {
+            PARK_ENABLED.store(false, Relaxed);
+            Ok(())
+        }
+        other => Err(format!(
+            "PANDA_LWIP_LOCK_PARK must be \"0\" or \"1\", got {other:?}"
+        )),
+    }
+}
+
+// Lock word protocol (classic three-state futex mutex):
+//   0 = free, 1 = held (uncontended), 2 = held with possible parked waiters.
+// Fast-path acquirers CAS 0->1; any thread that reaches the park phase
+// acquires with 2 instead, so its own unlock keeps waking the queue, and a
+// woken waiter re-marks a stolen lock 1->2 before parking again — parked
+// threads therefore always have either the mark or an awake guardian.
+const UNLOCKED: u8 = 0;
+const LOCKED: u8 = 1;
+const LOCKED_CONTENDED: u8 = 2;
+
 // One cache line per lock (128 covers Apple Silicon lines and the x86
 // adjacent-line prefetcher pair): the per-shard mutexes live in adjacent
 // statics, and two shards spin-waiting on one shared line would ping-pong
@@ -140,7 +203,7 @@ pub mod lock_stats {
 #[derive(Debug)]
 #[repr(align(128))]
 pub struct AtomicMutex {
-    locked: AtomicBool,
+    state: AtomicU8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,18 +227,22 @@ pub struct AtomicMutexGuard<'a> {
 impl AtomicMutex {
     pub const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            state: AtomicU8::new(UNLOCKED),
         }
     }
 
     pub fn try_lock(&self) -> Result<AtomicMutexGuard<'_>, AtomicMutexErr> {
-        if self.locked.swap(true, Acquire) {
-            Err(AtomicMutexErr)
-        } else {
+        if self
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+            .is_ok()
+        {
             Ok(AtomicMutexGuard {
                 mutex: self,
                 stats: None,
             })
+        } else {
+            Err(AtomicMutexErr)
         }
     }
 
@@ -184,31 +251,18 @@ impl AtomicMutex {
     }
 
     pub fn lock_at(&self, site: usize) -> AtomicMutexGuard<'_> {
-        // Bounded spin, then yield. The previous pure `loop { try_lock }`
-        // burned the whole OS thread while waiting: on a small tokio
-        // runtime (worker_threads(2) in the iOS packet tunnel), one worker
-        // holding the lock in sys_check_timeouts while another spun here
-        // meant NO other task could be polled — with enough contenders the
-        // runtime live-locked permanently. Yielding lets the OS reschedule
-        // the holder (and lets other runtime threads make progress) at the
-        // cost of a syscall on the slow path. Unlike a parking mutex, this
-        // never blocks the worker thread off the scheduler.
+        // Bounded spin, then yield, then (desktop) park. The pure
+        // `loop { try_lock }` history is above: spinning without yields
+        // live-locked the small iOS runtime, and unbounded yielding burns
+        // a core per waiter once tenures grow past a few microseconds.
         let started = if lock_stats::ENABLED.load(Relaxed) {
             Some(Instant::now())
         } else {
             None
         };
-        let mut spins = 0u32;
-        let mut guard = loop {
-            if let Ok(m) = self.try_lock() {
-                break m;
-            }
-            spins += 1;
-            if spins < 64 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+        let mut guard = match self.try_lock() {
+            Ok(guard) => guard,
+            Err(AtomicMutexErr) => self.lock_contended(),
         };
         if let Some(started) = started {
             let acquired = Instant::now();
@@ -220,6 +274,76 @@ impl AtomicMutex {
             guard.stats = Some((acquired, site));
         }
         guard
+    }
+
+    #[cold]
+    fn lock_contended(&self) -> AtomicMutexGuard<'_> {
+        let park = PARK_ENABLED.load(Relaxed);
+        let mut spins = 0u32;
+        // Once this thread has parked it must keep acquiring with the
+        // contended mark so its own unlock continues waking the queue.
+        let mut acquire_contended = false;
+        loop {
+            let observed = self.state.load(Relaxed);
+            if observed == UNLOCKED {
+                let next = if acquire_contended {
+                    LOCKED_CONTENDED
+                } else {
+                    LOCKED
+                };
+                if self
+                    .state
+                    .compare_exchange_weak(UNLOCKED, next, Acquire, Relaxed)
+                    .is_ok()
+                {
+                    return AtomicMutexGuard {
+                        mutex: self,
+                        stats: None,
+                    };
+                }
+                continue;
+            }
+            spins += 1;
+            if spins < LOCK_SPIN_BUDGET {
+                std::hint::spin_loop();
+                continue;
+            }
+            if !park || spins < LOCK_SPIN_BUDGET + LOCK_YIELD_BUDGET {
+                std::thread::yield_now();
+                continue;
+            }
+            // Escalate: publish the contended mark, then park until an
+            // unlock hands the queue a wake. The validate closure re-checks
+            // the mark so an unlock racing this park aborts it instead of
+            // stranding the thread.
+            if observed == LOCKED
+                && self
+                    .state
+                    .compare_exchange(LOCKED, LOCKED_CONTENDED, Relaxed, Relaxed)
+                    .is_err()
+            {
+                continue;
+            }
+            unsafe {
+                let _ = parking_lot_core::park(
+                    self.park_key(),
+                    || self.state.load(Relaxed) == LOCKED_CONTENDED,
+                    || {},
+                    |_, _| {},
+                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                    None,
+                );
+            }
+            acquire_contended = true;
+            // Woken (or aborted): retry with a fresh yield budget before
+            // the next park so short holder tenures still hand off without
+            // another futex round trip.
+            spins = LOCK_SPIN_BUDGET;
+        }
+    }
+
+    fn park_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
     }
 }
 
@@ -236,7 +360,16 @@ impl<'a> Drop for AtomicMutexGuard<'a> {
                 .held_ns
                 .fetch_add(acquired.elapsed().as_nanos() as u64, Relaxed);
         }
-        let _prev = self.mutex.locked.swap(false, Release);
-        debug_assert!(_prev);
+        let prev = self.mutex.state.swap(UNLOCKED, Release);
+        debug_assert!(prev != UNLOCKED);
+        if prev == LOCKED_CONTENDED {
+            // Someone may be parked; hand the queue one wake. A spurious
+            // wake on an already-empty queue is a cheap hash-bucket probe.
+            unsafe {
+                parking_lot_core::unpark_one(self.mutex.park_key(), |_| {
+                    parking_lot_core::DEFAULT_UNPARK_TOKEN
+                });
+            }
+        }
     }
 }

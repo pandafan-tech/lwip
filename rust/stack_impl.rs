@@ -19,7 +19,16 @@ pub(crate) static LWIP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 pub(crate) const DEFAULT_MTU: u16 = 1500;
 const OUTPUT_PACKET_CACHE: usize = 256;
 const OUTPUT_PACKET_MAX_CAPACITY: usize = 2048;
-const _: () = assert!(MEM_ALIGNMENT == 1);
+// Was pinned to 1 when the owned-input custom-pbuf path landed (2026-07-24)
+// to document that `Vec<u8>` payloads (alignment 1) are handed to
+// `pbuf_alloced_custom` verbatim. That stays sound at alignment 8: PBUF_RAW
+// uses offset 0, so the payload pointer is never realigned and the
+// `payload_mem_len` check does not grow. The alignment itself had defaulted
+// to 1 since the port began, which left every static MEMP pool array only
+// byte-aligned — element addresses depended on linker placement, and a BSS
+// layout shift finally landed the TCP_PCB pool on an odd address
+// (2026-08-29). 8 makes the pools genuinely aligned on every 64-bit target.
+const _: () = assert!(MEM_ALIGNMENT == 8);
 #[cfg(target_os = "ios")]
 const _: () = assert!(MEMP_NUM_TCP_PCB == 1024);
 #[cfg(windows)]
@@ -211,6 +220,7 @@ pub fn configure_tcp_tuning(
 
 pub(crate) fn initialize_lwip(shard: ShardRef) {
     super::mutex::lock_stats::init_from_env();
+    super::mutex::init_park_from_env().unwrap_or_else(|error| panic!("{error}"));
     if std::env::var_os("PANDA_LWIP_ZEROCOPY_EGRESS").is_some() {
         super::output::ZEROCOPY_EGRESS.store(true, Ordering::Relaxed);
     }

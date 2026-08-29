@@ -29,7 +29,7 @@ unsafe fn pbuf_pool_desc() -> &'static MempDesc {
     unsafe { &*std::ptr::addr_of!(memp_PBUF_POOL) }
 }
 
-unsafe fn assert_inactive_slots_untouched(effective: u16) {
+unsafe fn assert_inactive_slots_untouched(effective: u16, expected_freelist: usize) {
     let desc = unsafe { pbuf_pool_desc() };
     let stride = usize::from(desc.size);
     let inactive_start = unsafe { desc.base.add(usize::from(effective) * stride) };
@@ -63,7 +63,12 @@ unsafe fn assert_inactive_slots_untouched(effective: u16) {
         node = unsafe { std::ptr::read_unaligned(node.cast::<*mut Memp>()) };
     }
 
-    assert_eq!(freelist_len, usize::from(effective));
+    // Lazy carving (2026-08-29): the free list holds only RETURNED
+    // elements — after a fresh init it is empty, and it grows as callers
+    // free what they carved. The old eager contract (freelist == effective
+    // at init) would itself dirty every active element's page.
+    assert_eq!(freelist_len, expected_freelist);
+    assert!(freelist_len <= usize::from(effective));
     assert_eq!(inactive_freelist_nodes, 0);
 }
 
@@ -121,7 +126,7 @@ fn pbuf_pool_runtime_limit_leaves_inactive_bss_untouched() {
             assert_eq!(initialized.configured, ACTIVE_CAPACITY);
             assert_eq!(initialized.effective, ACTIVE_CAPACITY);
             assert_eq!(initialized.compile_capacity, 512);
-            unsafe { assert_inactive_slots_untouched(ACTIVE_CAPACITY) };
+            unsafe { assert_inactive_slots_untouched(ACTIVE_CAPACITY, 0) };
 
             configure_pbuf_pool_capacity(ACTIVE_CAPACITY)
                 .expect("reapplying the active capacity must be idempotent");
@@ -142,7 +147,7 @@ fn pbuf_pool_runtime_limit_leaves_inactive_bss_untouched() {
                 ACTIVE_CAPACITY,
                 "a sequential NetStack must reuse, not rebuild, the active pool"
             );
-            unsafe { assert_inactive_slots_untouched(ACTIVE_CAPACITY) };
+            unsafe { assert_inactive_slots_untouched(ACTIVE_CAPACITY, 0) };
 
             let mut allocated = Vec::new();
             loop {
@@ -163,7 +168,7 @@ fn pbuf_pool_runtime_limit_leaves_inactive_bss_untouched() {
                 unsafe { memp_free_pool(std::ptr::addr_of!(memp_PBUF_POOL), slot) };
             }
             assert_eq!(pbuf_pool_runtime_stats().used, 0);
-            unsafe { assert_inactive_slots_untouched(ACTIVE_CAPACITY) };
+            unsafe { assert_inactive_slots_untouched(ACTIVE_CAPACITY, usize::from(ACTIVE_CAPACITY)) };
 
             drop(udp);
             drop(listener);
