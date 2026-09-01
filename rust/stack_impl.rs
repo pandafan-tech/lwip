@@ -34,7 +34,7 @@ const _: () = assert!(MEMP_NUM_TCP_PCB == 1024);
 #[cfg(windows)]
 const _: () = assert!(TCP_WND == 2872 * PANDA_BASE_TCP_MSS);
 #[cfg(windows)]
-const _: () = assert!(TCP_WND_RUNTIME_DEFAULT == 512 * PANDA_BASE_TCP_MSS);
+const _: () = assert!(TCP_WND_RUNTIME_DEFAULT == 2048 * PANDA_BASE_TCP_MSS);
 
 #[cfg(windows)]
 const TCP_RCV_WND_MSS_ENV: &str = "PANDA_LWIP_TCP_RCV_WND_MSS";
@@ -770,21 +770,21 @@ mod tests {
     #[test]
     fn windows_tcp_receive_window_parser_accepts_only_the_supported_range() {
         assert_eq!(
-            parse_windows_tcp_rcv_window_mss(None, 2872, 512).unwrap(),
-            512
+            parse_windows_tcp_rcv_window_mss(None, 2872, 2048).unwrap(),
+            2048
         );
         assert_eq!(
-            parse_windows_tcp_rcv_window_mss(Some("2".as_ref()), 2872, 512).unwrap(),
+            parse_windows_tcp_rcv_window_mss(Some("2".as_ref()), 2872, 2048).unwrap(),
             2
         );
         assert_eq!(
-            parse_windows_tcp_rcv_window_mss(Some("2872".as_ref()), 2872, 512).unwrap(),
+            parse_windows_tcp_rcv_window_mss(Some("2872".as_ref()), 2872, 2048).unwrap(),
             2872
         );
 
         for invalid in ["", "one", "1", "2873", "2.0", " 512"] {
             assert!(
-                parse_windows_tcp_rcv_window_mss(Some(invalid.as_ref()), 2872, 512).is_err(),
+                parse_windows_tcp_rcv_window_mss(Some(invalid.as_ref()), 2872, 2048).is_err(),
                 "{invalid:?} must be rejected"
             );
         }
@@ -803,7 +803,7 @@ mod tests {
             OsString::from_wide(&[0xd800])
         };
 
-        assert!(parse_windows_tcp_rcv_window_mss(Some(&invalid), 2872, 512).is_err());
+        assert!(parse_windows_tcp_rcv_window_mss(Some(&invalid), 2872, 2048).is_err());
     }
 
     #[test]
@@ -823,7 +823,7 @@ mod tests {
                             Some(OsString::from("512"))
                         },
                         2872,
-                        512,
+                        2048,
                         PANDA_BASE_TCP_MSS,
                         |_| {
                             applies.fetch_add(1, Ordering::SeqCst);
@@ -854,7 +854,7 @@ mod tests {
                 Some(OsString::from("1"))
             },
             2872,
-            512,
+            2048,
             PANDA_BASE_TCP_MSS,
             |_| {
                 applies.fetch_add(1, Ordering::SeqCst);
@@ -868,7 +868,7 @@ mod tests {
                 Some(OsString::from("512"))
             },
             2872,
-            512,
+            2048,
             PANDA_BASE_TCP_MSS,
             |_| {
                 applies.fetch_add(1, Ordering::SeqCst);

@@ -193,10 +193,14 @@
 // Scale 6 raises the advertised-window ceiling to 4,194,240 bytes. Windows
 // needs a receive budget above 384 MSS to cross the virtualized TUN feedback
 // knee: same-window ABBA measured 384 MSS at 7.75-8.57 Gbit/s and 512 MSS at
-// 18.37-19.45 Gbit/s. Windows compiles the largest whole-MSS window that fits
-// scale 6 so runtime sweeps do not require rebuilding, while keeping 512 MSS
-// as the active default. PANDA_LWIP_TCP_RCV_WND_MSS selects the active value
-// once at process startup. macOS and Linux keep their existing fixed budget.
+// 18.37-19.45 Gbit/s. A 2026-09-01 physical-plus-virtual Windows ABBA/BAAB
+// confirmation held the 512-MSS send buffer and every other runtime knob
+// constant: raising only the receive window from 512 to 2048 MSS materially
+// improved single-stream forward and bidirectional throughput on both hosts.
+// Windows compiles the largest whole-MSS window that fits scale 6 so runtime
+// sweeps do not require rebuilding, with 2048 MSS as the active default.
+// PANDA_LWIP_TCP_RCV_WND_MSS selects a rollback/override value once at process
+// startup. macOS and Linux keep their existing fixed budget.
 //
 // Desktop MSS ceiling: the effective MSS is min(TCP_MSS, netif->mtu - 40)
 // per connection, so this only sets how far the runtime `tun.mtu` knob can
@@ -220,15 +224,14 @@
 #define TCP_RCV_SCALE 6
 #if defined(_WIN32)
 #define TCP_WND (2872 * PANDA_BASE_TCP_MSS)
-#define TCP_WND_RUNTIME_DEFAULT (512 * PANDA_BASE_TCP_MSS)
+#define TCP_WND_RUNTIME_DEFAULT (2048 * PANDA_BASE_TCP_MSS)
 // The send buffer bounds the DOWNLOAD direction the way the receive window
-// bounds upload, and the lwIP tuning guidance is explicit that it must
-// cover the window to reach full throughput. Windows tuned its receive
-// side to the 512-MSS class but left the send buffer at 256 MSS
-// (373 KiB): on the virtualized-TUN 3-6 ms RTT that caps a single
-// download flow at ~600 Mbit/s (373 KiB per round trip) regardless of
-// CPU. Match the active window class; per-connection payload memory is
-// heap-on-demand (MEM_LIBC_MALLOC), not a static allocation.
+// bounds upload. Windows previously left it at 256 MSS (373 KiB): on the
+// virtualized-TUN 3-6 ms RTT that capped a single download flow at
+// ~600 Mbit/s regardless of CPU. The receive-only two-host confirmation kept
+// the 512-MSS send buffer fixed, so there is no evidence to raise it with the
+// receive default. Per-connection payload memory is heap-on-demand
+// (MEM_LIBC_MALLOC), not a static allocation.
 #define TCP_SND_BUF (512 * PANDA_BASE_TCP_MSS)
 #else
 // macOS/Linux desktop: the 2026-08-25 loopback TUN bench measured single
