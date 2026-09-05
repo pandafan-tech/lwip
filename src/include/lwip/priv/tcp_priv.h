@@ -134,6 +134,23 @@ err_t            tcp_process_refused_data(struct tcp_pcb *pcb);
 #define TCP_MSL 60000UL /* The maximum segment lifetime in milliseconds */
 #endif
 
+/* How long a pcb stays in TIME-WAIT before tcp_slowtmr() reaps it, in
+ * milliseconds. RFC 793 sizes this as 2*MSL so a real network has time to
+ * finish delivering any duplicate/delayed segment for the old connection
+ * before its 4-tuple is reused; defaulting to that keeps stock lwIP
+ * behavior unchanged for ports that never override it. lwIP has no
+ * separate memp pool for TIME-WAIT pcbs (they share MEMP_TCP_PCB with
+ * active ones) and both tcp_input()'s per-segment TIME-WAIT lookup and
+ * tcp_alloc()'s pool-exhaustion eviction are linear scans of tcp_tw_pcbs,
+ * so a port whose lwIP instance only ever talks to its own kernel/TUN
+ * side (no real WAN hop terminates here -- see this port's override) can
+ * cut this down far below 2*MSL without weakening any real duplicate-
+ * segment protection, which shrinks that list and every scan over it.
+ */
+#ifndef TCP_TW_TIMEOUT
+#define TCP_TW_TIMEOUT (2 * TCP_MSL)
+#endif
+
 /* Keepalive values, compliant with RFC 1122. Don't change this unless you know what you're doing */
 #ifndef  TCP_KEEPIDLE_DEFAULT
 #define  TCP_KEEPIDLE_DEFAULT     7200000UL /* Default KEEPALIVE timer in milliseconds */
